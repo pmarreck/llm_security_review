@@ -1,0 +1,13 @@
+# Runtime / test outputs from running secreview against local trees
+SECURITY_FINDINGS.md
+SECURITY_FINDINGS.actionable.md
+SECURITY_*.md.bak.*
+*.actionable.md
+*.bak.*
+
+# Private agent config (symlinks into a personal vault on this machine)
+AGENTS.md
+CLAUDE.md
+
+# macOS
+.DS_Store

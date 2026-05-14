@@ -1,0 +1,1094 @@
+#!/usr/bin/env bash
+# secreview — LLM-driven per-file security review.
+#
+# Walks a path (file or directory), classifies each source file by extension,
+# builds a language-specific security-audit prompt, shells out to a local LLM
+# CLI in non-interactive mode, and splices the response into a master findings
+# markdown doc with begin/end markers + reviewed_at + file_mtime so reruns
+# only re-review files that have changed since their last review.
+#
+# Three audit flavors:
+#   .ex / .exs  -> Elixir/Erlang prompt (matches elixir_reviewer.ex semantics)
+#   .zig        -> Zig-focused prompt (memory/error/FFI/comptime)
+#   *           -> generic OWASP-flavored prompt (placeholder for JS/Py/etc.)
+#
+# CLI auto-detection order: claude > codex > gemini. Override with
+# SECREVIEW_LLM_CLI=<name>. Output goes to ./SECURITY_FINDINGS.md by default.
+
+set -u
+
+VERSION="0.1.0"
+
+# -------------------------- defaults --------------------------
+
+DEFAULT_OUT="SECURITY_FINDINGS.md"
+DEFAULT_STYLE="deep"        # deep | simple
+DEFAULT_EXTENSIONS=(zig ex exs)
+DEFAULT_MIN_LOC=10          # skip files with fewer non-blank lines
+CLI_PREFERENCE=(claude codex gemini)
+
+# Directory-name patterns pruned from the walk by default. Each entry is a
+# directory basename (not a path); any dir whose basename matches one of these
+# is pruned, never descended into. Override with --exclude / --no-default-
+# excludes. `build` and `out` are intentionally NOT in this list because they
+# are common source-dir names (e.g. validate/src/build/).
+DEFAULT_EXCLUDE_DIRS=(
+	.git .jj .hg .svn
+	.claude .serena .codescan .cursor .idea .vscode
+	.worktrees
+	.zig-cache zig-out
+	_build .elixir_ls .lexical
+	node_modules dist
+	target
+	vendor deps
+	__pycache__ .pytest_cache .tox
+	.next .nuxt
+	cover coverage
+)
+
+# -------------------------- prompt fragments --------------------------
+#
+# Most of the Elixir-specific text is lifted from elixir_reviewer.ex with light
+# edits so it reads naturally outside the original module context.
+
+read -r -d '' SINK_CLASSES_ELIXIR <<'EOF' || true
+Sink classes — every place dangerous logic could live, regardless of whether
+the input currently looks hostile. Enumerate first, judge second.
+
+  * Code execution — eval, dynamic dispatch on a computed name (`apply`,
+    `Code.eval_*`, `:erlang.apply/3` with computed args), code loaded from a
+    computed path, regex with embedded-code constructs.
+  * Command execution — `System.cmd`, `:os.cmd`, `Port.open({:spawn, …})`,
+    shelling out where args are built by concatenation rather than passed as
+    a list.
+  * File operations — `File.read/write/rm/cp/ln/chmod` where the path is
+    computed; `Code.require_file` / `Code.eval_file` with dynamic paths.
+  * Path handling — `Path.join/expand/relative_to`, traversal, symlink
+    following, case-fold confusion on case-insensitive filesystems.
+  * Archive extraction — `:erl_tar`, `:zip`, any unpack where entry names
+    become filesystem paths (zip-slip).
+  * Deserialisation — `:erlang.binary_to_term/1` (no `:safe`),
+    `Plug.Crypto.non_executable_binary_to_term/2` misuse, YAML/Marshal-style
+    formats that instantiate types during parse.
+  * Template / interpolation — values reaching another interpreted context
+    without escaping for it: HTML, SQL via raw fragments, EEx/Phoenix
+    `raw/1`, shell, regex, format strings, log lines.
+  * Network — clients that follow redirects, accept URLs from input, resolve
+    hostnames from data, TLS verification disabled (`verify: :verify_none`),
+    proxy handling, SSRF via internal-address resolution.
+  * Validation — predicates whose contract is "this is safe": the sink is
+    the return value, the danger is returning the wrong answer.
+  * Cryptography — KDF parameters, IV reuse, mode/padding, MAC verification,
+    `==` on secrets instead of `Plug.Crypto.secure_compare/2`.
+  * Memory safety — Rust `unsafe`, raw pointers, unchecked indexing, FFI,
+    transmute. For NIFs: lifetime/aliasing across the BEAM boundary.
+  * Shared mutable state — `Application.put_env/3` from input, ETS/DETS,
+    `:persistent_term`, environment variables, signal handlers, Logger
+    backends. One input poisoning what another sees.
+  * Concurrency — check-then-act sequences a racer can interleave: file
+    existence before open, permission before access, GenServer state read
+    then written without serialisation.
+  * Resource consumption — atom leaks (`String.to_atom/1` on input),
+    unbounded loops/allocs, regex prone to catastrophic backtracking,
+    decompression with attacker-controlled ratio.
+  * Reflection / metaprogramming gadgets the library installs into the
+    caller — `__using__` macros, `@before_compile`, telemetry handler
+    attaches, Logger backends, monkeypatched callbacks.
+  * Round-trip integrity — pairs meant to be inverses: `encode`/`decode`,
+    `parse`/`serialize`, `marshal`/`unmarshal`. Asymmetry lets a value
+    change meaning across a store-and-reload cycle and bypass parse-time
+    validation on re-parse.
+EOF
+
+read -r -d '' ALWAYS_FLAG_ELIXIR <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`:erlang.binary_to_term/1`, or `:erlang.binary_to_term/2` without
+    `:safe` in the options list.** Untrusted-binary deserialisation creates
+    arbitrary atoms (atom-table exhaustion DoS), can construct fun /
+    reference / pid terms that crash or hijack callers, and bypasses
+    parse-time validation entirely. The safe alternatives are
+    `:erlang.binary_to_term(bin, [:safe])` and
+    `Plug.Crypto.non_executable_binary_to_term/2`. Severity: **Critical**.
+
+  * **`:erlang.binary_to_term/2` with `:safe`.** `:safe` blocks new atoms
+    and funs, but the decoded term is still attacker-shaped: deeply nested
+    structures cause memory amplification, existing atoms can still be
+    referenced, and callers that pattern-match on a specific shape can
+    crash. Worth a note so reviewers can confirm the caller validates the
+    result. Severity: **Low**.
+EOF
+
+read -r -d '' SINK_CLASSES_ZIG <<'EOF' || true
+Sink classes — every place dangerous logic could live, regardless of whether
+the input currently looks hostile. Enumerate first, judge second.
+
+  * Memory safety — allocator lifetime mismatches (allocated with A, freed
+    with B), use-after-free across arena reset, stack-slice escape
+    (returning `&local` or a slice of it), defer ordering bugs that free
+    too early, leaks across error returns (missing `errdefer`), double-free,
+    aliasing of resized slices after `ArrayList.append`/`resize`.
+  * Error discipline — `catch unreachable` on values that can come from
+    input, errors silently demoted via `catch null` or `_ = ... catch {}`,
+    `try` paths that leave partial state in place because no `errdefer`
+    cleans it up.
+  * Integer overflow & casting — wrapping operators (`+%`, `-%`, `*%`) on
+    size/index math, `@intCast` truncation of attacker-controlled length,
+    signedness flips, off-by-one in slice arithmetic, mixing `usize` and
+    fixed-width ints across a serialization boundary.
+  * Undefined behavior — reading `undefined`, alignment violations via
+    `@ptrCast`/`@alignCast` without an alignment check, `@enumFromInt` on
+    untrusted integers without validating membership, pointer arithmetic
+    that escapes its allocation, `@bitCast` between unrelated layouts.
+  * C FFI / extern boundary — `extern fn` callbacks invoked from C with
+    the wrong ABI, sentinel-terminated strings constructed without the
+    sentinel, opaque pointer ownership unclear (who frees?), `errno`
+    handling, struct layout / alignment assumptions, `@cImport` whose
+    arguments come from build inputs.
+  * File operations — `std.fs.cwd().openFile/createFile/deleteFile` with
+    computed paths, no symlink check, traversal via `..` segments in
+    untrusted path components, TOCTOU between `statFile` and open.
+  * Command execution — `std.process.Child.init` with shell semantics or
+    argv built by concatenation, `std.os.execve` with computed argv.
+  * Deserialization — `std.json.parseFromSlice` etc. on attacker input
+    with no bound on resulting structure depth or array length,
+    `std.mem.bytesAsValue` / `bytesToValue` over untrusted bytes,
+    bincode-style raw decoding without length validation.
+  * Network — `std.http.Client` with TLS verification disabled, redirect
+    following from untrusted URLs, hostname resolution from data
+    (SSRF to internal addresses), proxy handling.
+  * Concurrency — `std.atomic` with wrong memory ordering, mutex held over
+    blocking I/O, async frame outliving its allocation, thread-unsafe
+    globals or `std.ArrayList` shared without a lock.
+  * Parser / decoder pitfalls — length-prefixed records with no maximum,
+    decompression with attacker-controlled ratio, slice arithmetic that
+    isn't bounds-checked against input length, infinite loops on malformed
+    input, sentinel scans that don't terminate on hostile data.
+  * Cryptography — KDF parameters fixed at low cost, IV reuse, ECB,
+    MAC not verified before decrypt, `std.mem.eql` on secrets instead of
+    `std.crypto.utils.timingSafeEql` (or equivalent constant-time compare).
+  * Resource consumption — unbounded `ArrayList.append` loops on input,
+    recursion without depth limit, pre-allocations sized directly from
+    input, arena that's never reset under attacker-controlled growth.
+  * Build & comptime — `@embedFile` on a computed path, `@cImport` with
+    computed args, `build.zig` running commands derived from environment,
+    `comptime` evaluation of attacker-supplied strings.
+  * Round-trip integrity — encode/decode pairs that aren't actual inverses;
+    a value can change meaning across a serialize/parse cycle and bypass
+    parse-time validation on re-parse.
+EOF
+
+read -r -d '' ALWAYS_FLAG_ZIG <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`catch unreachable` on a value that crosses a trust boundary.**
+    Demotes a recoverable error to immediate UB and (in safe modes) a panic
+    — a remote-DoS vector when the input came from a network or file
+    boundary. Severity: **High**.
+
+  * **`@ptrCast` / `@alignCast` to a stricter alignment without an explicit
+    alignment check on the source pointer.** Reads through the result are
+    UB. Severity: **High**.
+
+  * **`@enumFromInt` on untrusted integers with no membership validation.**
+    Constructs an out-of-range enum; subsequent use is UB. Severity:
+    **High**.
+
+  * **`std.process.Child` invoked with shell-style command strings or argv
+    built by string concatenation.** Classic command injection.
+    Severity: **Critical**.
+
+  * **TLS verification disabled** — explicit flag, custom verifier that
+    returns OK, or skipping certificate validation. Severity: **High**.
+
+  * **`std.mem.bytesAsValue` / `bytesToValue` / `@ptrCast` over attacker-
+    supplied byte buffers without a length AND alignment check on the
+    source slice.** Severity: **High**.
+EOF
+
+read -r -d '' SINK_CLASSES_GENERIC <<'EOF' || true
+Sink classes — language-agnostic, OWASP-aware. Enumerate first, judge
+second. The OWASP tags at the end of each bullet are reminders, not a
+substitute for naming the concrete primitive in this file.
+
+  * Code execution — `eval`, `exec`, `Function()` / `new Function`,
+    dynamic dispatch on a computed name, reflection that loads code from
+    input, template engines in unsafe modes. (OWASP A03 Injection)
+  * Command execution — `system`, backticks, `subprocess` with
+    `shell=True`, `exec*p` with PATH lookup of an attacker-supplied name,
+    argv built by string concatenation. (OWASP A03)
+  * Injection — SQL via string concat, NoSQL via dict/object merge,
+    LDAP, XPath, OS command, log injection (CRLF), header injection,
+    template injection (SSTI). (OWASP A03)
+  * File operations — open/read/write/delete/chmod/chown with a computed
+    path, archive extraction (zip-slip), symlink following, TOCTOU
+    between `stat` and open. (OWASP A01, A03)
+  * Path handling — traversal, case-fold confusion, Windows drive
+    letters, UNC paths, `..` segments not normalized before policy
+    check. (OWASP A01)
+  * Deserialization — pickle / Marshal / Java serialization / PHP
+    unserialize / YAML.load / binary_to_term-style formats that
+    instantiate types during parse. (OWASP A08 Software & Data
+    Integrity)
+  * Template / interpolation — values reaching another interpreted
+    context without escaping for that context: HTML, SQL, shell, regex,
+    log lines, format strings. (OWASP A03)
+  * Network — clients that follow redirects, accept URLs from input,
+    resolve hostnames from data, TLS verification disabled, proxy
+    handling, SSRF via internal-address resolution. (OWASP A10 SSRF,
+    A02 Crypto)
+  * Validation — predicates whose contract is "this is safe": the sink
+    is the return value, the danger is returning the wrong answer.
+  * Cryptography — KDF parameters, IV reuse, mode/padding, MAC
+    verification order, `==` on secrets instead of constant-time
+    compare, weak RNG for secrets, broken algorithms (MD5/SHA1/DES).
+    (OWASP A02)
+  * Memory / type safety — for unsafe languages: unchecked indexing,
+    raw pointers, FFI, transmute, alignment, integer overflow in size
+    math.
+  * Shared mutable state — globals/singletons mutated from input, env
+    vars consumed without normalization, race-prone caches.
+  * Concurrency — TOCTOU, missing locks, atomic-ordering mismatches,
+    re-entrant callbacks holding locks.
+  * Resource consumption — unbounded loops/allocs from input, regex
+    prone to catastrophic backtracking, decompression bombs (zip,
+    gzip, brotli), XML billion-laughs, hash-flooding. (OWASP A04
+    Insecure Design)
+  * Authentication / session — fixation, weak tokens, missing
+    rotation, timing oracles in compare, MFA bypass paths. (OWASP A07)
+  * Authorization — missing checks, IDOR, role escalation via mass-
+    assignment. (OWASP A01)
+  * Logging / observability — secrets in logs, missing audit on
+    sensitive actions, log forging via unescaped input. (OWASP A09)
+  * Round-trip integrity — encode/decode or marshal/unmarshal pairs
+    that aren't actual inverses; a value can change meaning across a
+    store-and-reload cycle and bypass parse-time validation on
+    re-parse.
+EOF
+
+read -r -d '' ALWAYS_FLAG_GENERIC <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`eval`, `exec`, `Function()`, `setTimeout(string)`, `new Function`,
+    or any other code-from-string construct** with a value that is not
+    statically a constant in this file. Severity: **Critical**.
+
+  * **SQL via string concatenation or interpolation into a query string.**
+    Even when inputs "look" sanitized — use parameterized queries.
+    Severity: **Critical**.
+
+  * **Shell out with `shell=True` / `system` / backticks / argv built by
+    concatenation.** Command injection. Severity: **Critical**.
+
+  * **Deserialization of untrusted bytes with a format that instantiates
+    arbitrary types** (pickle, Marshal, Java/PHP unserialize, YAML.load,
+    `binary_to_term` without `:safe`). Severity: **Critical**.
+
+  * **TLS verification disabled** (`verify=False`, `rejectUnauthorized:
+    false`, `InsecureSkipVerify: true`, custom verifier that returns
+    true). Severity: **High**.
+
+  * **Weak crypto primitives** used for security purposes — MD5/SHA1
+    for password hashing or signatures, DES/3DES, ECB mode, hardcoded
+    keys/IVs. Severity: **High**.
+EOF
+
+read -r -d '' OWASP_REMINDER <<'EOF' || true
+## OWASP Top 10 coverage check
+
+After your inventory and per-sink pass, sweep the file once more with the
+OWASP Top 10 (2021) categories in mind and add any sinks you missed:
+
+  * A01 Broken Access Control — authorization checks, IDOR, path traversal
+  * A02 Cryptographic Failures — weak algos, key handling, TLS misuse
+  * A03 Injection — SQL, command, log, template, deserialization-via-text
+  * A04 Insecure Design — algorithmic complexity attacks, missing rate limits
+  * A05 Security Misconfiguration — debug modes, default creds, verbose errors
+  * A06 Vulnerable Components — pinned vulnerable versions referenced here
+  * A07 Identification & Authentication Failures — session, MFA, timing oracles
+  * A08 Software & Data Integrity Failures — deserialization, unsigned updates
+  * A09 Security Logging & Monitoring Failures — secret leakage, missing audit
+  * A10 SSRF — outbound requests to addresses derived from input
+
+Tag each finding with the most specific OWASP category that applies.
+EOF
+
+read -r -d '' PER_FILE_DEEP_METHODOLOGY <<'EOF' || true
+## Methodology
+
+Two phases. Don't skip phase 1 — skipping it is what makes audits miss bugs.
+
+Phase 1 — inventory. List every sink in this file using the sink classes
+below. Don't judge any of them yet — a sink is dangerous-if-input-is-hostile,
+regardless of whether you currently think the input is hostile. Grep
+exhaustively for the language's primitives in each class.
+
+Phase 2 — for each sink in your inventory, in order:
+
+  1. Trace — where does the value come from? If it's a hardcoded constant
+     or internal data only, write "internal" and stop.
+  2. Boundary — does it originate from a function parameter exposed
+     publicly, or some other source crossing a trust boundary? The
+     library's caller is *not* the attacker — but data the caller
+     forwards from the network, from disk, or from deserialisation is.
+  3. Validate — sketch a one-paragraph reproduction (input → effect).
+     If a guard in the file rules it out, name the guard and stop.
+  4. Impact — what is the real-world impact? What can an attacker that
+     exploits this actually do? Explain this in simple terms.
+  5. Rate — Critical / High / Medium / Low.
+
+Every sink ends up either as a finding or in `## Ruled out` with the
+step that disqualified it.
+EOF
+
+read -r -d '' PER_FILE_DEEP_OUTPUT <<'EOF' || true
+## Output
+
+Use plain, easy-to-understand, concise language. Focus on the real-world
+impact of the findings.
+
+If the file has no sinks at all (truly nothing dangerous-looking to even
+consider), output exactly:
+
+    No findings.
+
+Otherwise, for each finding output one block in this format:
+
+    ### <Short title>
+    **Severity:** Critical | High | Medium | Low
+    **CWE:** CWE-NNN (if a clear match exists)
+    **OWASP:** A0N <category name> (if applicable)
+    **Location:** <relative/path>:<line> | <relative/path>:<line_start>-<line_end>
+    **Class:** <sink class>
+
+    **Trace:** <one short paragraph backwards from sink to where the
+    value enters this file>
+
+    **Boundary:** <which trust boundary the input crosses, or "internal">
+
+    **Impact:** <a short paragraph on the real-world impact>
+
+    **Validation:** <one short paragraph reproduction sketch — input that
+    would trigger the sink and what dangerous behaviour follows. If a
+    guard in the file blocks it, name the guard.>
+
+    **Suggested fix:** <one or two sentences>
+
+Then, if any sinks were considered and dropped, append:
+
+    ## Ruled out
+
+    - `<file>:<line>` (<sink class>, step N) — <one-sentence reason>
+
+Listing ruled-out sinks is required when phase 1 found any — it's how the
+audit demonstrates it considered them. No preamble, no overall summary.
+EOF
+
+# -------------------------- prompt builders --------------------------
+
+# build_simple_prompt LANG_HEADER SINK_CLASSES ALWAYS_FLAG
+build_simple_prompt() {
+	local lang_header="$1" sinks="$2" always_flag="$3"
+	cat <<EOF
+You are a senior application security engineer auditing one source file from
+an open-source ${lang_header} project. Find real, exploitable
+vulnerabilities only — no style, no speculation.
+
+You see this one file in isolation. Flag only bugs you can argue from this
+file alone. Skim the file with the vector list below in mind and report
+what's actually dangerous; don't write up an inventory or methodology.
+
+${always_flag}
+
+${sinks}
+
+${OWASP_REMINDER}
+
+## Output
+
+If the file has no real vulnerabilities, output exactly:
+
+    No findings.
+
+Otherwise, for each finding output one block in this format:
+
+    ### <Short title>
+    **Severity:** Critical | High | Medium | Low
+    **OWASP:** A0N <category> (if applicable)
+    **Location:** <relative/path>:<line> | <relative/path>:<line_start>-<line_end>
+
+    **Description:** <one short paragraph: what's vulnerable and how it
+    could be exploited. If a guard in the file blocks the obvious attack,
+    name the guard.>
+
+    **Suggested fix:** <one or two sentences>
+
+No preamble, no overall summary, no ruled-out section.
+EOF
+}
+
+# build_deep_prompt LANG_HEADER SINK_CLASSES ALWAYS_FLAG
+build_deep_prompt() {
+	local lang_header="$1" sinks="$2" always_flag="$3"
+	cat <<EOF
+You are a senior application security engineer auditing one source file from
+an open-source ${lang_header} project. Find real, exploitable bugs only —
+no style, no speculation.
+
+You see this one file in isolation. You cannot trace inputs across modules
+or check reach. Flag only bugs you can argue from this file alone.
+
+${PER_FILE_DEEP_METHODOLOGY}
+
+${always_flag}
+
+${sinks}
+
+${OWASP_REMINDER}
+
+${PER_FILE_DEEP_OUTPUT}
+EOF
+}
+
+# language_for EXT  ->  prints elixir|zig|generic
+language_for() {
+	case "$1" in
+		ex|exs) printf 'elixir' ;;
+		zig)    printf 'zig' ;;
+		*)      printf 'generic' ;;
+	esac
+}
+
+# header_for LANG -> human-readable language label for the prompt preamble
+header_for() {
+	case "$1" in
+		elixir) printf 'Elixir/Erlang' ;;
+		zig)    printf 'Zig' ;;
+		*)      printf 'general-purpose' ;;
+	esac
+}
+
+# build_prompt STYLE LANG REL_PATH CONTENT
+build_prompt() {
+	local style="$1" lang="$2" rel_path="$3" content="$4"
+	local sinks always lang_header base
+	case "$lang" in
+		elixir) sinks="$SINK_CLASSES_ELIXIR"; always="$ALWAYS_FLAG_ELIXIR" ;;
+		zig)    sinks="$SINK_CLASSES_ZIG";    always="$ALWAYS_FLAG_ZIG" ;;
+		*)      sinks="$SINK_CLASSES_GENERIC";always="$ALWAYS_FLAG_GENERIC" ;;
+	esac
+	lang_header=$(header_for "$lang")
+
+	if [[ "$style" == "simple" ]]; then
+		base=$(build_simple_prompt "$lang_header" "$sinks" "$always")
+	else
+		base=$(build_deep_prompt "$lang_header" "$sinks" "$always")
+	fi
+
+	printf '%s\n\nFile path: %s\n```\n%s\n```\n' "$base" "$rel_path" "$content"
+}
+
+# -------------------------- LLM invocation --------------------------
+
+detect_cli() {
+	if [[ -n "${SECREVIEW_LLM_CLI:-}" ]]; then
+		printf '%s' "$SECREVIEW_LLM_CLI"
+		return 0
+	fi
+	local cli
+	for cli in "${CLI_PREFERENCE[@]}"; do
+		if command -v "$cli" >/dev/null 2>&1; then
+			printf '%s' "$cli"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# invoke_llm PROMPT
+# Writes the LLM response to stdout. Returns non-zero on failure.
+invoke_llm() {
+	local prompt="$1"
+	local out_tmp rc
+	case "$LLM_CLI" in
+		claude)
+			# Claude Code headless mode: -p reads from stdin when no prompt
+			# argument is given. Pipe the prompt to avoid argv length limits.
+			printf '%s' "$prompt" | claude -p
+			;;
+		codex)
+			# `codex exec` reads the prompt from stdin when the prompt arg is
+			# `-`. Default stdout for `codex exec` interleaves agent status; we
+			# capture just the final message via `-o FILE` and emit that.
+			#
+			# --skip-git-repo-check : this tool runs on arbitrary source trees,
+			#                         not necessarily git repos.
+			# --ephemeral           : don't persist a session file per review.
+			# --color never         : keep the captured output free of ANSI.
+			out_tmp=$(mktemp)
+			if printf '%s' "$prompt" | codex exec \
+				--skip-git-repo-check \
+				--ephemeral \
+				--color never \
+				-o "$out_tmp" \
+				- >/dev/null 2>&1; then
+				cat "$out_tmp"
+				rc=0
+			else
+				rc=$?
+			fi
+			rm -f "$out_tmp"
+			return "$rc"
+			;;
+		gemini)
+			# Best-guess; refine when gemini CLI is installed and verified.
+			printf '%s' "$prompt" | gemini -p -
+			;;
+		*)
+			printf 'secreview: unknown LLM CLI: %s\n' "$LLM_CLI" >&2
+			return 1
+			;;
+	esac
+}
+
+# -------------------------- master doc management --------------------------
+#
+# Each file's review block is bounded by HTML comment markers carrying both
+# the review timestamp and the source file's mtime at review time. A rerun
+# uses file_mtime to decide whether to re-review.
+#
+#   <!-- secreview:begin file="REL/PATH" reviewed_at="ISO8601" file_mtime="ISO8601" -->
+#   ## REL/PATH
+#   ...
+#   <!-- secreview:end file="REL/PATH" -->
+
+init_doc_if_missing() {
+	local doc="$1"
+	[[ -f "$doc" ]] && return 0
+	cat > "$doc" <<EOF
+# Security Findings
+
+_Generated by secreview v${VERSION}. Each section below corresponds to one
+reviewed source file. Markers (HTML comments) carry the review timestamp
+and the source file's mtime at review time — rerun secreview to refresh
+sections whose source has changed since._
+
+EOF
+}
+
+# mtime_iso PATH -> ISO 8601 UTC mtime of the file (portable across BSD/GNU
+# stat and BSD/GNU date — detected independently because either combination
+# can appear, e.g. macOS with nix-installed GNU coreutils).
+mtime_iso() {
+	local path="$1"
+	local epoch
+	if stat --version >/dev/null 2>&1; then
+		epoch=$(stat -c '%Y' "$path")
+	else
+		epoch=$(stat -f '%m' "$path")
+	fi
+	if date --version >/dev/null 2>&1; then
+		# GNU date: epoch via @EPOCH
+		date -u -d "@$epoch" +"%Y-%m-%dT%H:%M:%SZ"
+	else
+		# BSD date: epoch via -r EPOCH
+		date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ"
+	fi
+}
+
+now_iso() {
+	date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# get_recorded_mtime DOC FILE -> prints the recorded file_mtime for FILE, or
+# nothing if no entry exists.
+get_recorded_mtime() {
+	local doc="$1" file="$2"
+	[[ -f "$doc" ]] || return 0
+	# Use awk for portable parsing.
+	awk -v want="$file" '
+		{
+			# Match: <!-- secreview:begin file="X" reviewed_at="Y" file_mtime="Z" -->
+			if (match($0, /<!-- secreview:begin file="[^"]+" reviewed_at="[^"]+" file_mtime="[^"]+" -->/)) {
+				line = $0
+				# Extract file
+				f = line
+				sub(/.*file="/, "", f); sub(/".*/, "", f)
+				if (f != want) next
+				# Extract file_mtime
+				m = line
+				sub(/.*file_mtime="/, "", m); sub(/".*/, "", m)
+				print m
+				exit
+			}
+		}
+	' "$doc"
+}
+
+# remove_section DOC FILE -> remove the existing block for FILE in-place
+remove_section() {
+	local doc="$1" file="$2"
+	[[ -f "$doc" ]] || return 0
+	local tmp
+	tmp=$(mktemp)
+	awk -v want="$file" '
+		BEGIN { skipping = 0 }
+		{
+			if (!skipping && match($0, /<!-- secreview:begin file="[^"]+"/)) {
+				f = $0
+				sub(/.*file="/, "", f); sub(/".*/, "", f)
+				if (f == want) { skipping = 1; next }
+			}
+			if (skipping && match($0, /<!-- secreview:end file="[^"]+" -->/)) {
+				f = $0
+				sub(/.*file="/, "", f); sub(/".*/, "", f)
+				if (f == want) { skipping = 0; next }
+			}
+			if (!skipping) print
+		}
+	' "$doc" > "$tmp" && mv "$tmp" "$doc"
+}
+
+# append_section DOC FILE REVIEWED_AT FILE_MTIME BODY
+append_section() {
+	local doc="$1" file="$2" reviewed_at="$3" file_mtime="$4" body="$5"
+	{
+		printf '\n<!-- secreview:begin file="%s" reviewed_at="%s" file_mtime="%s" -->\n' \
+			"$file" "$reviewed_at" "$file_mtime"
+		printf '## %s\n\n' "$file"
+		printf '_Reviewed %s · file mtime at review %s · CLI %s · style %s_\n\n' \
+			"$reviewed_at" "$file_mtime" "$LLM_CLI" "$STYLE"
+		printf '%s\n' "$body"
+		printf '\n<!-- secreview:end file="%s" -->\n' "$file"
+	} >> "$doc"
+}
+
+# -------------------------- actionable extraction --------------------------
+
+# extract_actionable IN OUT
+# Read a findings doc and emit only those file-sections whose body contains
+# at least one `### ` heading (the deep/simple prompt output specs both use
+# `### <title>` exclusively for actual findings; `## Ruled out` and the
+# per-file `## <path>` heading are at level 2 and don't trigger).
+extract_actionable() {
+	local in="$1" out="$2"
+	if [[ ! -f "$in" ]]; then
+		printf 'secreview: input findings doc not found: %s\n' "$in" >&2
+		return 1
+	fi
+
+	{
+		printf '# Security Findings — Actionable\n\n'
+		printf '_Extracted from `%s` on %s. Sections containing no `### `\n' \
+			"$(basename "$in")" "$(now_iso)"
+		printf 'finding blocks (i.e. "No findings." or only ruled-out items)\n'
+		printf 'are omitted; the original markers are preserved so each kept\n'
+		printf 'section can be cross-referenced against the full report._\n\n'
+	} > "$out"
+
+	# Buffer each begin..end section in awk; only emit if a `### ` line was
+	# seen inside that buffer.
+	awk '
+		/<!-- secreview:begin file="/ {
+			buf = $0 ORS
+			in_section = 1
+			has_finding = 0
+			next
+		}
+		in_section {
+			buf = buf $0 ORS
+			if ($0 ~ /^### /) has_finding = 1
+			if ($0 ~ /<!-- secreview:end file="/) {
+				if (has_finding) printf "%s\n", buf
+				in_section = 0
+				buf = ""
+			}
+			next
+		}
+	' "$in" >> "$out"
+
+	local kept total
+	kept=$(grep -c 'secreview:begin' "$out" 2>/dev/null || printf '0')
+	total=$(grep -c 'secreview:begin' "$in" 2>/dev/null || printf '0')
+	printf 'secreview: kept %s / %s section(s) with actionable findings → %s\n' \
+		"$kept" "$total" "$out" >&2
+}
+
+# -------------------------- file discovery --------------------------
+
+# collect_files TARGET
+# Reads configuration from globals:
+#   EXTENSIONS  (array)   - file extensions without leading dot
+#   EXCLUDE_DIRS (array)  - directory basenames to prune
+collect_files() {
+	local target="$1"
+	if [[ -f "$target" ]]; then
+		# Single explicit file: emit regardless of extension/excludes — the
+		# user pointed at it directly.
+		printf '%s\n' "$target"
+		return 0
+	fi
+	if [[ ! -d "$target" ]]; then
+		printf 'secreview: not a file or directory: %s\n' "$target" >&2
+		return 1
+	fi
+
+	# Build extension-name alternation:  -name '*.ex' -o -name '*.exs' …
+	local -a ext_args=()
+	local first=1 e
+	for e in "${EXTENSIONS[@]}"; do
+		if (( first )); then
+			ext_args+=( -name "*.${e}" )
+			first=0
+		else
+			ext_args+=( -o -name "*.${e}" )
+		fi
+	done
+
+	# Build directory-prune alternation:  -name .git -o -name .jj …
+	local -a prune_args=()
+	if (( ${#EXCLUDE_DIRS[@]} > 0 )); then
+		first=1
+		local d
+		for d in "${EXCLUDE_DIRS[@]}"; do
+			if (( first )); then
+				prune_args+=( -name "$d" )
+				first=0
+			else
+				prune_args+=( -o -name "$d" )
+			fi
+		done
+	fi
+
+	# Compose the full expression. Two shapes depending on whether we have
+	# anything to prune:
+	#
+	#   no prunes:   find T -type f \( ext... \) -print
+	#   w/ prunes:   find T \( -type d \( prunes \) -prune \) -o \
+	#                       \( -type f \( ext... \) -print \)
+	if (( ${#prune_args[@]} == 0 )); then
+		find "$target" -type f \( "${ext_args[@]}" \) -print 2>/dev/null | sort
+	else
+		find "$target" \
+			\( -type d \( "${prune_args[@]}" \) -prune \) \
+			-o \
+			\( -type f \( "${ext_args[@]}" \) -print \) \
+			2>/dev/null | sort
+	fi
+}
+
+# -------------------------- main --------------------------
+
+usage() {
+	cat <<EOF
+secreview v${VERSION} — LLM-driven per-file security review
+
+Usage: secreview [options] <path>
+
+  <path>             A source file or directory to recurse.
+
+Options:
+  --out <file>       Master findings markdown (default: ${DEFAULT_OUT})
+  --style <s>        deep | simple (default: ${DEFAULT_STYLE})
+  --ext <list>       Comma-separated list of extensions to scan
+                     (default: ${DEFAULT_EXTENSIONS[*]})
+  --max-files <n>    Stop after reviewing this many files (skipped files
+                     don't count toward the cap). 0 means no cap.
+  --min-loc <n>      Skip files with fewer than n non-blank lines
+                     (default: ${DEFAULT_MIN_LOC}). Set to 0 to disable.
+  --exclude <name>   Add a directory basename to the prune set (repeatable).
+                     Any directory whose basename matches is skipped.
+  --no-default-excludes
+                     Don't apply the built-in prune list (.git, .jj, deps,
+                     node_modules, .zig-cache, zig-out, .claude, …).
+                     Useful when you want to audit vendored code.
+  --fresh            Overwrite the findings doc instead of resuming.
+  --force            Re-review every file even if unchanged.
+  --cli <name>       Override LLM CLI (claude|codex|gemini).
+                     Equivalent to SECREVIEW_LLM_CLI=<name>.
+  --dry-run          Print what would be reviewed (banner + indented list
+                     to stderr); do not call the LLM.
+  --list             Emit the files that would actually be reviewed (one
+                     path per line on stdout) and exit. Applies the same
+                     filter chain as the real run: extensions, excludes,
+                     resume-skip (unless --force), --min-loc, and
+                     --max-files. Pipe-friendly. Alias: --list-candidates.
+  --extract-actionable
+                     Standalone post-processor: read --out (defaults to
+                     ${DEFAULT_OUT}) and emit a filtered copy containing
+                     only sections with at least one \`### \` finding
+                     block. "No findings." and ruled-out-only sections are
+                     dropped. Writes to <out>.actionable.md by default;
+                     override with --actionable-out PATH.
+                     No source path argument is required in this mode.
+  --actionable-out <path>
+                     Output path for --extract-actionable.
+  -h, --help         Show this help.
+  --version          Print version.
+
+Environment:
+  SECREVIEW_LLM_CLI  Override the CLI auto-detection (claude|codex|gemini).
+
+Behavior:
+  Each reviewed file gets a section in the findings doc bounded by HTML
+  comment markers that record the review datetime and the source file's
+  mtime at review time. On rerun:
+    * file has no entry        -> review it
+    * source mtime > recorded  -> re-review (replace section)
+    * source mtime <= recorded -> skip (use --force to override)
+EOF
+}
+
+main() {
+	local path="" out="$DEFAULT_OUT" style="$DEFAULT_STYLE"
+	local fresh=0 force=0 dry_run=0 list_mode=0 cli_override="" max_files=0
+	local min_loc="$DEFAULT_MIN_LOC"
+	local use_default_excludes=1
+	local extract_mode=0 actionable_out=""
+	local -a exts=("${DEFAULT_EXTENSIONS[@]}")
+	local -a user_excludes=()
+
+	while (( $# )); do
+		case "$1" in
+			--out)     out="$2"; shift 2 ;;
+			--style)   style="$2"; shift 2 ;;
+			--ext)
+				IFS=',' read -r -a exts <<< "$2"
+				shift 2
+				;;
+			--max-files)
+				max_files="$2"
+				if ! [[ "$max_files" =~ ^[0-9]+$ ]]; then
+					printf 'secreview: --max-files must be a non-negative integer, got: %s\n' "$max_files" >&2
+					return 2
+				fi
+				shift 2
+				;;
+			--min-loc)
+				min_loc="$2"
+				if ! [[ "$min_loc" =~ ^[0-9]+$ ]]; then
+					printf 'secreview: --min-loc must be a non-negative integer, got: %s\n' "$min_loc" >&2
+					return 2
+				fi
+				shift 2
+				;;
+			--exclude)
+				user_excludes+=("$2")
+				shift 2
+				;;
+			--no-default-excludes)
+				use_default_excludes=0
+				shift
+				;;
+			--fresh)   fresh=1; shift ;;
+			--force)   force=1; shift ;;
+			--cli)     cli_override="$2"; shift 2 ;;
+			--dry-run) dry_run=1; shift ;;
+			--list|--list-candidates) list_mode=1; shift ;;
+			--extract-actionable) extract_mode=1; shift ;;
+			--actionable-out) actionable_out="$2"; shift 2 ;;
+			-h|--help) usage; return 0 ;;
+			--version) printf 'secreview v%s\n' "$VERSION"; return 0 ;;
+			--)        shift; path="$1"; shift ;;
+			-*)        printf 'secreview: unknown option: %s\n' "$1" >&2; return 2 ;;
+			*)
+				if [[ -z "$path" ]]; then
+					path="$1"
+				else
+					printf 'secreview: extra positional arg: %s\n' "$1" >&2
+					return 2
+				fi
+				shift
+				;;
+		esac
+	done
+
+	# --extract-actionable is a standalone post-processor: no source path,
+	# no LLM, no findings-doc writes. Run it and exit.
+	if (( extract_mode )); then
+		if [[ -z "$actionable_out" ]]; then
+			# default: foo.md -> foo.actionable.md ; foo -> foo.actionable
+			if [[ "$out" == *.md ]]; then
+				actionable_out="${out%.md}.actionable.md"
+			else
+				actionable_out="${out}.actionable"
+			fi
+		fi
+		extract_actionable "$out" "$actionable_out"
+		return $?
+	fi
+
+	if [[ -z "$path" ]]; then
+		printf 'secreview: missing <path>. See --help.\n' >&2
+		return 2
+	fi
+	case "$style" in
+		simple|deep) : ;;
+		*) printf 'secreview: --style must be simple or deep, got: %s\n' "$style" >&2; return 2 ;;
+	esac
+
+	# Assemble exclusion list and expose collect_files inputs via globals.
+	local -a excludes=()
+	(( use_default_excludes )) && excludes+=("${DEFAULT_EXCLUDE_DIRS[@]}")
+	(( ${#user_excludes[@]} > 0 )) && excludes+=("${user_excludes[@]}")
+	EXTENSIONS=("${exts[@]}")
+	EXCLUDE_DIRS=("${excludes[@]}")
+
+	# Collect files (cheap; no LLM needed yet).
+	local -a files=()
+	local f
+	while IFS= read -r f; do
+		[[ -n "$f" ]] && files+=("$f")
+	done < <(collect_files "$path")
+
+	# --list / --list-candidates: emit the post-filter "what would be
+	# reviewed" set on stdout and exit. Skips CLI detection and findings-
+	# doc setup, but applies the same per-file filters as the real loop:
+	# resume-skip (unless --force), --min-loc, --max-files.
+	if (( list_mode )); then
+		local listed=0 loc file_mtime recorded_mtime
+		for f in "${files[@]}"; do
+			if (( ! force )); then
+				file_mtime=$(mtime_iso "$f")
+				recorded_mtime=$(get_recorded_mtime "$out" "$f")
+				if [[ -n "$recorded_mtime" && "$recorded_mtime" == "$file_mtime" ]]; then
+					continue
+				fi
+			fi
+			if (( min_loc > 0 )); then
+				loc=$(grep -cv '^[[:space:]]*$' "$f" 2>/dev/null || printf '0')
+				(( loc < min_loc )) && continue
+			fi
+			printf '%s\n' "$f"
+			listed=$((listed + 1))
+			if (( max_files > 0 && listed >= max_files )); then
+				break
+			fi
+		done
+		return 0
+	fi
+
+	# Resolve CLI
+	if [[ -n "$cli_override" ]]; then
+		LLM_CLI="$cli_override"
+	else
+		if ! LLM_CLI=$(detect_cli); then
+			printf 'secreview: no LLM CLI found on PATH (tried: %s).\n' \
+				"${CLI_PREFERENCE[*]}" >&2
+			printf '         install one or set SECREVIEW_LLM_CLI / --cli.\n' >&2
+			return 1
+		fi
+	fi
+	if ! command -v "$LLM_CLI" >/dev/null 2>&1; then
+		printf 'secreview: selected CLI not on PATH: %s\n' "$LLM_CLI" >&2
+		return 1
+	fi
+	STYLE="$style"
+	export LLM_CLI STYLE
+
+	# Handle --fresh
+	if (( fresh )) && [[ -f "$out" ]]; then
+		# Move to .bak rather than delete — never destroy data.
+		mv "$out" "${out}.bak.$(date +%s)"
+	fi
+
+	local count="${#files[@]}"
+	if (( count == 0 )); then
+		printf 'secreview: no files matched (extensions: %s) under: %s\n' \
+			"${exts[*]}" "$path" >&2
+		return 0
+	fi
+
+	local extras=""
+	(( max_files > 0 ))           && extras+=$(printf ' · max-files=%d' "$max_files")
+	(( min_loc > 0 ))             && extras+=$(printf ' · min-loc=%d' "$min_loc")
+	(( ${#excludes[@]} > 0 ))     && extras+=$(printf ' · excluding=%d dirs' "${#excludes[@]}")
+	printf 'secreview: %d file(s) to consider · CLI=%s · style=%s%s · out=%s\n' \
+		"$count" "$LLM_CLI" "$style" "$extras" "$out" >&2
+
+	if (( dry_run )); then
+		for f in "${files[@]}"; do printf '  %s\n' "$f" >&2; done
+		return 0
+	fi
+
+	init_doc_if_missing "$out"
+
+	local idx=0 reviewed=0 skipped=0 too_small=0 failed=0
+	local f ext lang content prompt body loc
+	local file_mtime recorded_mtime reviewed_at
+	for f in "${files[@]}"; do
+		idx=$((idx + 1))
+		ext="${f##*.}"
+		lang=$(language_for "$ext")
+		file_mtime=$(mtime_iso "$f")
+
+		# Resume logic: skip if entry exists and mtime hasn't advanced.
+		if (( ! force )); then
+			recorded_mtime=$(get_recorded_mtime "$out" "$f")
+			if [[ -n "$recorded_mtime" && "$recorded_mtime" == "$file_mtime" ]]; then
+				printf '[%d/%d] skip   %s (unchanged since %s)\n' \
+					"$idx" "$count" "$f" "$recorded_mtime" >&2
+				skipped=$((skipped + 1))
+				continue
+			fi
+		fi
+
+		# Insubstantial-file gate: count non-blank lines.
+		if (( min_loc > 0 )); then
+			loc=$(grep -cv '^[[:space:]]*$' "$f" 2>/dev/null || printf '0')
+			if (( loc < min_loc )); then
+				printf '[%d/%d] small  %s (%d non-blank lines < %d)\n' \
+					"$idx" "$count" "$f" "$loc" "$min_loc" >&2
+				too_small=$((too_small + 1))
+				continue
+			fi
+		fi
+
+		printf '[%d/%d] review %s (%s)\n' "$idx" "$count" "$f" "$lang" >&2
+
+		if ! content=$(cat "$f" 2>/dev/null); then
+			printf '         (could not read; skipping)\n' >&2
+			failed=$((failed + 1))
+			continue
+		fi
+
+		prompt=$(build_prompt "$style" "$lang" "$f" "$content")
+		reviewed_at=$(now_iso)
+		if ! body=$(invoke_llm "$prompt"); then
+			printf '         (LLM call failed; skipping)\n' >&2
+			failed=$((failed + 1))
+			continue
+		fi
+		if [[ -z "${body// }" ]]; then
+			body='_(empty response from LLM)_'
+			failed=$((failed + 1))
+		fi
+
+		# Replace existing block (if any), then append the new one.
+		remove_section "$out" "$f"
+		append_section "$out" "$f" "$reviewed_at" "$file_mtime" "$body"
+		reviewed=$((reviewed + 1))
+
+		if (( max_files > 0 && reviewed >= max_files )); then
+			printf 'secreview: --max-files=%d reached, stopping.\n' "$max_files" >&2
+			break
+		fi
+	done
+
+	printf 'secreview: done · reviewed=%d skipped=%d too-small=%d failed=%d total=%d · %s\n' \
+		"$reviewed" "$skipped" "$too_small" "$failed" "$count" "$out" >&2
+}
+
+main "$@"
