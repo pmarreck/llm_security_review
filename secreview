@@ -23,7 +23,7 @@ VERSION="0.1.0"
 
 DEFAULT_OUT="SECURITY_FINDINGS.md"
 DEFAULT_STYLE="deep"        # deep | simple
-DEFAULT_EXTENSIONS=(zig ex exs)
+DEFAULT_EXTENSIONS=(zig ex exs py rs js mjs cjs jsx ts tsx)
 DEFAULT_MIN_LOC=10          # skip files with fewer non-blank lines
 CLI_PREFERENCE=(claude codex gemini)
 
@@ -305,6 +305,567 @@ the input comes from.
     keys/IVs. Severity: **High**.
 EOF
 
+read -r -d '' SINK_CLASSES_PYTHON <<'EOF' || true
+Sink classes — every place dangerous logic could live, regardless of whether
+the input currently looks hostile. Enumerate first, judge second.
+
+  * Code execution — `eval`, `exec`, `compile` on any non-literal string;
+    `__import__(name)` / `importlib.import_module(name)` /
+    `getattr(mod, name)` where `name` is computed; `types.FunctionType`
+    or `types.CodeType` built from input; `pickle.loads`, `marshal.loads`,
+    `dill.loads`, `shelve.open` on attacker bytes; `code.InteractiveInterpreter`
+    fed user lines. (OWASP A03 Injection / A08 Software & Data Integrity)
+  * Command execution — `os.system`, `os.popen`, `commands.getoutput`,
+    `subprocess.{run,Popen,call,check_call,check_output}` with `shell=True`
+    or with an argv list whose elements are built by `+`/f-string/`.format`,
+    `os.exec*` family, `pty.spawn`, `asyncio.create_subprocess_shell`,
+    `fabric`/`invoke` `run()` / `sudo()`. Treat `shlex.quote` as necessary
+    but not sufficient — argv lists are still preferred.
+    (OWASP A03 Injection)
+  * Deserialization — `pickle`/`cPickle`/`_pickle`, `marshal`, `shelve`,
+    `dill`, `jsonpickle.decode`, `yaml.load` (without `SafeLoader` /
+    `safe_load`), `PyYAML` `Loader=Loader|FullLoader`, `xmlrpc.client`
+    auto-unmarshalling, `pandas.read_pickle`, `numpy.load(allow_pickle=True)`,
+    `torch.load` without `weights_only=True`, `joblib.load`. All grant
+    arbitrary-class instantiation → RCE.
+    (OWASP A08 Software & Data Integrity)
+  * XML / structured-data parsers — `xml.etree.ElementTree.parse|fromstring`,
+    `xml.dom.minidom.parse`, `xml.sax.parse`, `lxml.etree.parse|fromstring`
+    with default resolvers, `xmlrpc` servers, `xml.dom.pulldom`. Without
+    `defusedxml` these expose XXE, billion-laughs, external-DTD SSRF, and
+    DoS via entity expansion. (OWASP A05 Misconfiguration / A10 SSRF)
+  * File / path operations — `open`, `io.open`, `pathlib.Path` joined with
+    user segments, `os.path.join` (does not sanitize `..` or absolute
+    components — an absolute later arg discards earlier ones),
+    `shutil.{copy,copytree,move,rmtree}`, `os.{remove,unlink,rename,chmod,
+    chown,symlink,link}`, `os.makedirs(exist_ok=True)` over a symlink,
+    `tempfile.mktemp` (TOCTOU; use `mkstemp`), `send_file` / `FileResponse`
+    on computed paths. Always resolve and re-check that the result stays
+    under an allow-listed root. (OWASP A01 Broken Access Control)
+  * Archive extraction — `tarfile.extractall`/`extract` without
+    `filter='data'` (Python ≥3.12) is zip-slip + symlink-escape +
+    device-node creation; `zipfile.extractall`/`extract` does not check
+    `..` or absolute paths in members; `shutil.unpack_archive` inherits
+    both; recursive/quine archives and decompression bombs (`zlib.decompress`,
+    `gzip`/`bz2`/`lzma` streams) need explicit size caps.
+    (OWASP A01 / A04 Insecure Design)
+  * Templates / SSTI / XSS — Jinja2 `Environment(autoescape=False)` or
+    `Template(user_string)` (template *source* from input is RCE, not
+    just XSS — `{{ ().__class__.__mro__[1].__subclasses__() }}`), Mako
+    `Template(text=...)`, Django `mark_safe`, `format_html` with
+    `%`/f-string pre-formatting, `|safe` filter on user data, `SafeString`
+    constructors, `string.Template.substitute` over a user template,
+    React-style dangerouslySetInnerHTML equivalents in server renders.
+    (OWASP A03 Injection)
+  * SQL / ORM injection — `cursor.execute(f"... {x} ...")`, `%`-format
+    or `+` concat into any DB-API `execute`/`executemany`/`executescript`,
+    Django `.raw()`, `.extra(where=, select=, tables=)`, `RawSQL`,
+    SQLAlchemy `text("... " + x)` or `.execute(string)`, SQLAlchemy
+    `Query.filter(text(...))`, `engine.execute(string)`, asyncpg /
+    psycopg `execute` without `%s` placeholders, ORDER BY / table-name
+    interpolation (placeholders cannot bind identifiers — use an
+    allow-list). (OWASP A03 Injection)
+  * NoSQL / query-language injection — pymongo `find(user_dict)` where
+    the dict came straight from `request.json` (operator injection via
+    `{"$ne": null}`, `{"$where": "..."}`), Elasticsearch query bodies
+    built from user dicts, LDAP filters via `ldap3`/`python-ldap` with
+    string concat (use `escape_filter_chars`), Redis `eval` of dynamic
+    Lua, GraphQL resolvers passing input straight into a downstream
+    query. (OWASP A03 Injection)
+  * Network / SSRF — `requests.{get,post,...}`, `httpx`, `urllib.request.
+    urlopen`, `urllib3`, `aiohttp.ClientSession.request`, `socket.connect`
+    on URLs/hostnames/IPs from input; `verify=False`, `cert_reqs=CERT_NONE`,
+    custom `SSLContext` with `check_hostname=False`; unconstrained
+    `allow_redirects=True` (redirect to `file://`, `gopher://`, link-local
+    169.254.169.254 metadata); DNS rebinding (resolve once, then connect
+    to the resolved IP, not the hostname). (OWASP A10 SSRF / A02 Crypto)
+  * Cryptography & secrets — `hashlib.md5|sha1|new('md5'|'sha1')` for
+    auth/signatures (collision), unsalted SHA-256 for passwords (use
+    `argon2`, `bcrypt`, `scrypt`, or `hashlib.scrypt`/`pbkdf2_hmac`),
+    `Crypto.Cipher.AES.new(key, AES.MODE_ECB)`, fixed/zero IV with CBC/CTR/
+    GCM, nonce reuse with GCM (catastrophic), `random`/`random.choice`/
+    `random.randint` for tokens/IDs/passwords (use `secrets.token_*` or
+    `os.urandom`), `==` comparing secrets/MACs/tokens (use
+    `hmac.compare_digest`), hardcoded keys/JWT secrets, `jwt.decode`
+    with `algorithms=['none']` or no `algorithms=` arg, `verify=False`.
+    (OWASP A02 Cryptographic Failures)
+  * Web framework misconfig — Flask `app.run(debug=True)` (Werkzeug
+    debugger = RCE via PIN), Django `DEBUG=True` in prod, missing
+    `ALLOWED_HOSTS`, `@csrf_exempt` / `MIDDLEWARE` without CSRF,
+    `SECURE_SSL_REDIRECT=False`, `SESSION_COOKIE_SECURE=False`,
+    `HttpResponseRedirect(request.GET['next'])` (open redirect),
+    `send_file(filename, as_attachment=True)` with computed `filename`,
+    `send_from_directory` with un-normalized subpath, FastAPI dependency
+    that authenticates *after* a path operation reads the body, CORS
+    `allow_origins=['*']` together with `allow_credentials=True` (spec
+    violation, browser will still leak in older paths). (OWASP A05 / A07)
+  * Authn / session — JWT `algorithms` containing `'none'` or both `HS256`
+    and `RS256` (key-confusion), session IDs from `random` not `secrets`,
+    password reset tokens that don't expire or aren't single-use, login
+    paths with `time.sleep`-based "timing protection" (still leak), 2FA
+    codes compared with `==`, Django `check_password` is constant-time
+    but `user.password == hash` is not. (OWASP A07 Auth Failures)
+  * Resource exhaustion — catastrophic-backtracking regex (nested
+    quantifiers like `(a+)+`, `(.*)*`, alternations with overlap) on
+    user input — `re` has no timeout; consider `re2`/`regex` with
+    `timeout=`. Unbounded `read()` / `recv()` / `request.data` /
+    `request.body`, unbounded `list.append` in a loop driven by input,
+    `int(s)` on attacker-controlled string with thousands of digits
+    (CVE-2020-10735 — set `sys.set_int_max_str_digits`), recursion
+    without depth cap, decompression without `max_length`/size guard.
+    (OWASP A04 Insecure Design / A05)
+  * Concurrency & shared state — module-level mutables (lists/dicts/sets)
+    mutated from request handlers, `threading` without `Lock`/`RLock`
+    around read-modify-write, `asyncio` tasks created without keeping a
+    reference (GC may cancel mid-flight), `asyncio.shield` misuse,
+    `signal.signal` from a non-main thread, monkey-patching `requests`/
+    `socket` after threads started, `functools.lru_cache` on a method
+    with a mutable default keying on `self` (memory leak + cross-tenant
+    bleed). (OWASP A04 Insecure Design)
+  * Logging & observability — `logger.info(f"user={user!r} pwd={pwd}")`,
+    `print(request.headers)` (Authorization, Cookie), unescaped `\r\n`
+    from input written into log lines (log forging / log injection),
+    structured-log fields built by `+` instead of `extra=`, exception
+    chains echoing query strings, Sentry/`logging.Formatter` capturing
+    `repr(locals())`. Error pages that leak stack traces to clients.
+    (OWASP A09 Logging Failures / A04)
+  * Validation & coercion contracts — predicates named `is_safe_*` /
+    `clean_*` whose body is a single regex without `\A...\Z` anchors
+    (`^...$` matches per-line under `re.MULTILINE`), `urllib.parse.urlparse`
+    used as a security check (it accepts `javascript:`, `data:`, schemes
+    with embedded `\n`, and userinfo-host confusions like
+    `http://evil@trusted/`), `int(x, 0)` accepting `0x`/`0o`/`0b`,
+    `bool(x)` where `bool("False") is True`, `json.loads` accepting NaN/
+    Infinity by default, encode/decode pairs that aren't true inverses
+    (`urllib.parse.quote` vs `unquote_plus`, `html.escape` over an
+    already-escaped string). (OWASP A04 Insecure Design)
+EOF
+
+read -r -d '' ALWAYS_FLAG_PYTHON <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`pickle.loads` / `cPickle.loads` / `_pickle.loads` / `dill.loads` /
+    `marshal.loads` / `shelve.open` / `pandas.read_pickle` /
+    `numpy.load(allow_pickle=True)` / `torch.load` without
+    `weights_only=True`.** Pickle is documented as unsafe for untrusted
+    bytes — `__reduce__` grants arbitrary callable + args, i.e. RCE on
+    deserialize. There is no "safe pickle." Severity: **Critical**.
+
+  * **`yaml.load(...)` without `Loader=yaml.SafeLoader` (or
+    `yaml.unsafe_load` / `Loader=yaml.Loader` / `Loader=yaml.FullLoader`).**
+    Resolves Python tags like `!!python/object/apply:os.system` →
+    immediate RCE. Use `yaml.safe_load`. Severity: **Critical**.
+
+  * **`eval(x)` / `exec(x)` / `compile(x, ...)` where `x` is not a
+    literal constant**, including `eval(f"...{user}...")` and
+    `exec(open(path).read())` over a path that isn't fixed. Also
+    `__import__(name)` / `importlib.import_module(name)` /
+    `getattr(obj, name)(...)` where `name` is computed from input.
+    Severity: **Critical**.
+
+  * **`subprocess.{run,Popen,call,check_call,check_output}` /
+    `os.system` / `os.popen` / `asyncio.create_subprocess_shell` with
+    `shell=True` and any non-literal in the command string**, or with
+    an argv list whose first element / any element is built by `+`,
+    f-string, or `.format` over input. Use an argv list of literals
+    plus pre-validated values; `shlex.quote` is a fallback, not the
+    fix. Severity: **Critical**.
+
+  * **`requests` / `httpx` / `aiohttp` / `urllib3` calls with
+    `verify=False`, `cert_reqs='CERT_NONE'`, or a custom `SSLContext`
+    with `check_hostname=False` / `verify_mode=CERT_NONE`.** Disables
+    TLS authentication — silent MITM. Likewise `ssl._create_unverified_context()`
+    or assignment to `ssl._create_default_https_context`.
+    Severity: **High**.
+
+  * **`xml.etree.ElementTree.{parse,fromstring,iterparse}`,
+    `xml.dom.minidom.parse{,String}`, `xml.sax.*`, `lxml.etree.{parse,
+    fromstring}` without `resolve_entities=False` / a hardened parser**,
+    or any XML parsing not routed through `defusedxml`. Enables XXE
+    (file read, SSRF), billion-laughs DoS, and external-DTD exfil.
+    Severity: **High**.
+
+  * **`hashlib.md5(...)` / `hashlib.sha1(...)` / `hashlib.new('md5'|
+    'sha1')` used for passwords, signatures, MACs, integrity, or
+    session/CSRF tokens** (non-security uses like cache keys are fine —
+    annotate with `usedforsecurity=False`). Likewise `Crypto.Cipher.
+    AES.new(key, AES.MODE_ECB)`, hardcoded keys/IVs/JWT secrets, and
+    `jwt.decode(..., algorithms=['none'])` or `jwt.decode(...,
+    verify=False)`. Severity: **High**.
+
+  * **Django `mark_safe(x)` / `SafeString(x)` / `format_html("...{}...",
+    x)` / `{{ x|safe }}` where `x` is not a constant**, and Jinja2
+    `Environment(autoescape=False)` for an HTML-rendering context, or
+    `Template(source)` where `source` came from input (template-source
+    injection is RCE in Jinja, not just XSS). Severity: **High**.
+
+  * **`tarfile.extractall` / `tarfile.extract` without
+    `filter='data'`** (Python 3.12+ default still warns; older versions
+    have no protection at all), and `zipfile.extractall` / `zipfile.
+    extract` without explicit per-member path validation against the
+    destination root. Both allow zip-slip, symlink escape, and
+    (tar only) device-node and setuid creation. Severity: **High**.
+
+  * **`random.{random,randint,choice,choices,sample,getrandbits}` used
+    to generate passwords, session IDs, CSRF tokens, password-reset
+    tokens, API keys, or nonces.** `random` is a Mersenne Twister —
+    fully predictable from ~624 outputs. Use `secrets.token_urlsafe`,
+    `secrets.token_bytes`, `secrets.choice`, or `os.urandom`.
+    Severity: **High**.
+EOF
+
+read -r -d '' SINK_CLASSES_RUST <<'EOF' || true
+Sink classes — every place dangerous logic could live, regardless of whether
+the input currently looks hostile. Enumerate first, judge second.
+
+  * `unsafe` blocks — `mem::transmute` between unrelated types, raw pointer
+    deref (`*const T` / `*mut T`), `slice::from_raw_parts(ptr, len)` and
+    `Vec::from_raw_parts(ptr, len, cap)` with attacker-derived `len`/`cap`,
+    `String::from_utf8_unchecked` on bytes that may not be valid UTF-8
+    (instant UB, breaks every downstream invariant).
+  * Uninitialized memory — `MaybeUninit::assume_init` before every field is
+    written, `mem::zeroed()` / `mem::uninitialized()` on types with niche
+    optimization (`&T`, `Box<T>`, `NonNull`, `bool`, `char`, enums) — the
+    bit pattern `0x00` is not a valid inhabitant and constructing one is
+    immediate UB even if you never read it.
+  * FFI boundary — `extern "C"` callbacks that may panic (UB across the
+    boundary unless wrapped in `catch_unwind`), ABI / struct-layout
+    mismatches with the C side, `*mut c_void` ownership ambiguity (who
+    frees?), `CStr::from_ptr` on non-NUL-terminated input, `CString::from_raw`
+    on a pointer not produced by `into_raw`, `#[repr(Rust)]` structs sent to
+    C, freeing a Rust `Box` with `libc::free` (or vice versa).
+  * Deserialization — `serde_json` / `bincode` / `postcard` / `rmp-serde` /
+    `ciborium` on untrusted bytes without a length cap or `Read::take(N)`
+    wrapper, `serde_yaml` (deprecated; historical alias / billion-laughs
+    issues), `toml` / `serde_json` deeply nested input causing stack
+    overflow in the recursive parser, `#[derive(Deserialize)]` on types
+    whose constructor enforces invariants the derive will silently bypass
+    (use `try_from` / a validating wrapper). (OWASP A08)
+  * Command execution — `std::process::Command::new("sh").arg("-c")` or
+    `args(["-c", payload])` with a computed payload, `Command::new(prog)`
+    where `prog` itself is attacker-controlled (PATH lookup), env passed
+    verbatim to a child, `which`-style resolution of untrusted names.
+    (OWASP A03)
+  * Filesystem & path ops — `std::fs::*` with a `Path` built from input,
+    `Path::join` on a segment that may be absolute or contain `..` (silently
+    discards the prefix), archive extraction without canonicalizing the
+    final path under the destination root (zip-slip in `zip` / `tar` /
+    `flate2`), symlink TOCTOU between `metadata` / `open`, hardlink swaps
+    on shared temp dirs, world-writable temp paths (use `tempfile`).
+    (OWASP A01)
+  * Network & SSRF — `reqwest` / `hyper` / `ureq` / `isahc` clients fed
+    URLs from input, `danger_accept_invalid_certs(true)` /
+    `danger_accept_invalid_hostnames(true)`, custom `ServerCertVerifier`
+    that returns `Ok(ServerCertVerified::assertion())` unconditionally,
+    redirect-following onto internal IP space, `tokio::net::lookup_host`
+    or `ToSocketAddrs` on attacker data (DNS rebinding / metadata-service
+    hits at `169.254.169.254`). (OWASP A10)
+  * Crypto misuse — hand-rolled crypto, `==` / `PartialEq` on secrets or
+    MACs instead of `subtle::ConstantTimeEq`, `rand::thread_rng()` /
+    `SmallRng` for keys/tokens/IVs (use `OsRng` or `rand::rngs::OsRng`),
+    MD5 / SHA1 / `Hmac<Md5>` for security, ECB mode, static / repeated IV
+    or nonce with AES-GCM / ChaCha20-Poly1305 (catastrophic key recovery),
+    raw `RustCrypto` block ciphers without an AEAD, JWT `alg: none` /
+    `HS256`-vs-`RS256` confusion. (OWASP A02)
+  * Integer & casting — release builds **disable** overflow checks, so `+`
+    / `-` / `*` silently wrap on attacker-controlled size/index math
+    (require `checked_*` / `saturating_*` / `wrapping_*` discipline), `as`
+    casts that truncate (`u64 as usize` on 32-bit, `i64 as i32`, `usize as
+    u32`), `try_into().unwrap()` on a length, signed/unsigned mixing in
+    capacity math.
+  * Panic & DoS — `.unwrap()` / `.expect()` on values that crossed a trust
+    boundary, `panic!` reachable from an HTTP / RPC handler, `slice[i]` /
+    `Vec[i]` indexing with an input-derived index, `chunks_exact` /
+    `split_at(n)` with `n > len`, integer division / `%` by zero, `assert!`
+    on input invariants in production. (OWASP A05)
+  * Concurrency & Send/Sync — `unsafe impl Send for X` / `unsafe impl Sync
+    for X` without an audit comment proving the invariant, `Mutex` /
+    `RwLock` poison errors swallowed via `.unwrap()` (mask earlier panics),
+    `AtomicUsize` ordering mismatches (`Relaxed` where `Acquire`/`Release`
+    is required), data races created by handing out two `&mut` from a raw
+    pointer, `Arc::get_mut` after clones leak, `Cell`/`UnsafeCell` shared
+    across threads.
+  * Async — cancel-safety violations: state mutated before an `.await` and
+    not restored on drop (e.g. partial DB write, half-released lock),
+    `tokio::spawn` of a future borrowing non-`'static` data via
+    `transmute` / `&'static` casts, blocking syscalls (`std::fs`,
+    `std::process::Command`, `std::thread::sleep`, CPU-bound loops) inside
+    an async task starving the executor — must use `spawn_blocking`.
+  * Resource exhaustion — `Vec::with_capacity(n)` / `String::with_capacity(n)`
+    where `n` comes from input, `.collect::<Vec<_>>()` /
+    `.collect::<String>()` on attacker-controlled iterator length, `read_to_end`
+    / `read_to_string` without `Read::take(LIMIT)`, decompression bombs
+    via `flate2` / `bzip2` / `zstd` / `xz2` / `zip` without a decoded-byte
+    cap, `regex` catastrophic backtracking when the `unicode` /
+    `perf-dfa-full` features are off or `RegexBuilder::size_limit` raised.
+    (OWASP A05)
+  * Build & supply chain — `build.rs` shelling out, downloading, or reading
+    `$OUT_DIR`-external paths, `proc_macro` crates from untrusted sources
+    (run at compile time with full host privileges), `include!` /
+    `include_bytes!` / `include_str!` over a computed path, `[patch]` /
+    `git = "..."` deps without a pinned rev, `cargo install` of
+    untrusted crates in CI, missing `cargo-deny` / RustSec advisory check.
+    (OWASP A06 / A08)
+  * Web framework — `actix-web` / `axum` / `rocket` / `warp` extractors
+    (`Json<T>`, `Form<T>`, `Bytes`, `Multipart`) without an explicit body
+    / field size limit, `FromRequest` impls that perform auth via headers
+    the framework also lets handlers override, missing CSRF on cookie-auth
+    state-changing routes, SSRF via an outbound `reqwest::Client` shared
+    with handlers, path extractors that don't reject `..`, raw SQL via
+    `format!` instead of `sqlx::query!` / parameter binding. (OWASP A03 /
+    A01)
+  * Round-trip & identity — encode/decode pairs that aren't true inverses
+    (URL-encode, percent-decode, HTML-escape, base64 with vs without
+    padding), `Display` / `to_string()` output used as a security
+    identifier or cache key, `PartialEq` on user-supplied IDs that
+    normalize differently than the storage layer (Unicode / case-fold /
+    NFC vs NFD).
+EOF
+
+read -r -d '' ALWAYS_FLAG_RUST <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`mem::transmute::<A, B>` between unrelated types, or any `transmute`
+    inside a generic function.** Layout, validity, and niche assumptions
+    differ between nominally-similar types; a single mismatched bit pattern
+    is immediate UB that LLVM may exploit globally. Prefer `as` casts,
+    `bytemuck`, or `From`/`TryFrom`. Severity: **Critical**.
+
+  * **`slice::from_raw_parts(ptr, len)` or `Vec::from_raw_parts(ptr, len,
+    cap)` where `len`/`cap` is not a compile-time constant audited against
+    the allocation.** Constructs an aliased / oversized slice; every read
+    is UB and every write corrupts adjacent allocations. Severity:
+    **Critical**.
+
+  * **`std::mem::zeroed()` or `MaybeUninit::<T>::uninit().assume_init()`
+    for any `T` other than a plain integer / float / `[u8; N]`.** Types
+    with niches (`&T`, `Box<T>`, `NonNull`, `bool`, `char`, most enums,
+    anything `#[repr(transparent)]` over the above) have invalid bit
+    patterns; constructing one is UB even if never read. Severity:
+    **Critical**.
+
+  * **`Command::new("sh").arg("-c")`, `args(["-c", payload])`, or
+    `Command::new(prog)` where `prog` is non-constant.** Classic command
+    injection — Rust gives you no shell-escape helper because there is no
+    safe one. Use `Command::new(fixed).args([...])` with separately-passed
+    argv. Severity: **Critical**.
+
+  * **`danger_accept_invalid_certs(true)`,
+    `danger_accept_invalid_hostnames(true)`, or any `ServerCertVerifier` /
+    `ClientCertVerifier` impl that returns `Ok(...)` without inspecting
+    the cert chain.** Disables TLS authentication; the connection is now
+    trivially MITM-able. Severity: **High**. (OWASP A02)
+
+  * **`unsafe impl Send for X` or `unsafe impl Sync for X` without a
+    `// SAFETY:` comment proving the invariant.** Send/Sync are the
+    backbone of Rust's data-race freedom; an unjustified impl on a type
+    holding a raw pointer, `Cell`, `Rc`, or FFI handle invites a data race
+    that the borrow checker can no longer catch. Severity: **High**.
+
+  * **`.unwrap()` / `.expect()` / `panic!` / `slice[i]` reachable from a
+    request handler, message loop, or other input-driven boundary.** Each
+    is a remote DoS — a single malformed input crashes the worker (or in
+    `actix-web` 1.x, the whole arbiter). Use `?`, `.get(i)`, or explicit
+    error responses. Severity: **High**. (OWASP A05)
+
+  * **`serde_yaml::from_str` / `bincode::deserialize` /
+    `rmp_serde::from_slice` / `ciborium::de::from_reader` on untrusted
+    bytes without a `Read::take(LIMIT)` wrapper or a configured size cap.**
+    Memory-exhaustion (giant `Vec`/`String` length prefixes) and stack
+    overflow (deeply nested structures) are reachable in the default
+    configuration. `serde_yaml` is additionally unmaintained as of 2024.
+    Severity: **High**. (OWASP A08)
+EOF
+
+read -r -d '' SINK_CLASSES_JS <<'EOF' || true
+Sink classes — every place dangerous logic could live in JS/TS, regardless
+of whether the input currently looks hostile. Enumerate first, judge
+second. Same prompt covers .js/.mjs/.cjs/.jsx/.ts/.tsx — TypeScript adds
+no new runtime sinks, only erased compile-time checks.
+
+  * Dynamic code execution — `eval`, `Function(...)` / `new Function`,
+    `setTimeout`/`setInterval`/`setImmediate` called with a string body,
+    `vm.runInNewContext`/`runInThisContext`/`Script`, `import(spec)` of a
+    computed specifier, `require(varname)` with non-literal path. The
+    CommonJS `require.cache` is also a write sink. (OWASP A03 Injection)
+  * OS command execution (Node) — `child_process.exec`/`execSync` (always
+    spawn a shell), `spawn`/`spawnSync`/`fork` with `{ shell: true }` or
+    argv built from input, `execFile` resolving an attacker-named binary
+    via `PATH`, `execa`/`zx`/`shelljs` template strings interpolating
+    untrusted values. Windows .bat/.cmd argv quoting (CVE-2024-27980)
+    needs explicit handling. (OWASP A03 Injection)
+  * Prototype pollution — recursive deep-merge over attacker JSON
+    (`lodash.merge`/`_.set`/`_.defaultsDeep`, `Object.assign({}, parsed)`
+    chains, hand-rolled `for (k in src)` merges), `JSON.parse` reviver
+    returning attacker objects, query-string parsers that auto-nest
+    (`qs`, `express` body parser with `extended: true`). Look for
+    `__proto__`, `constructor.prototype`, and class fields ever reaching
+    a writable target. (OWASP A08 Software & Data Integrity)
+  * Deserialization & structured parsing — `node-serialize.unserialize`,
+    `js-yaml.load` without `JSON_SCHEMA`/`SAFE_SCHEMA`, `xml2js`/`fast-
+    xml-parser` with entity expansion / DOCTYPE allowed (XXE, billion
+    laughs), `Buffer.from(str, enc)` where enc/length come from input,
+    `Buffer.allocUnsafe(n)` with attacker n leaking process memory.
+    (OWASP A08, A03)
+  * Path & filesystem ops — `fs.readFile`/`writeFile`/`createReadStream`/
+    `rm`/`unlink`/`rename`/`cp` with computed paths, archive extraction
+    (`tar`, `unzipper`, `adm-zip`, `node-stream-zip`) without entry-name
+    validation (zip-slip, absolute paths, `..`), symlink TOCTOU between
+    `lstat` and `open`, `path.join`/`resolve` of attacker segments
+    escaping a base dir. (OWASP A01 Broken Access Control)
+  * HTML/template injection (server-side) — EJS `<%- expr %>`, Pug
+    `!{expr}` / unescaped interpolation, Handlebars `{{{ triple }}}` and
+    `SafeString`, Nunjucks `| safe`, Mustache disabled escaping. Any
+    template engine compiling templates from input is SSTI →
+    RCE. (OWASP A03 Injection)
+  * DOM XSS sinks (browser/SSR-hydrated) — `innerHTML`/`outerHTML`/
+    `insertAdjacentHTML`, `document.write`/`writeln`, jQuery
+    `.html()`/`.append()`/`.before()`/`.after()`, `Range.createContext-
+    ualFragment`, `DOMParser.parseFromString` then re-injection, `<a>.
+    href = "javascript:..."`, `iframe.srcdoc`, `Element.setAttribute`
+    on any `on*` handler, React `dangerouslySetInnerHTML`, Vue `v-html`,
+    Angular `bypassSecurityTrustHtml`/`Script`/`Url`, Svelte `{@html}`.
+    (OWASP A03 Injection)
+  * Open redirect / navigation — `window.location`/`location.href`/
+    `assign`/`replace` taking input, `res.redirect(req.query.next)`,
+    Next.js `redirect()` of attacker URL, anchor `target="_blank"`
+    without `rel="noopener noreferrer"` (reverse-tabnabbing). (A01)
+  * SQL & NoSQL injection — tagged-template-less `db.query("... " + x)`,
+    `mysql`/`pg` raw string concat, knex `.raw(input)`, Sequelize
+    `literal()`/`where: [Op.and, sequelize.literal(...)]`, Prisma
+    `$queryRawUnsafe`, MongoDB filters built from `req.body` (operator
+    injection via `$ne`/`$gt`/`$where`/`$regex`), Mongoose `.find(req
+    .query)` without schema casting. (OWASP A03 Injection)
+  * Network egress / SSRF — `fetch`/`axios`/`got`/`undici`/`request`/
+    `node-fetch` with input URLs, `http.request({ host: input })`,
+    `dns.lookup` of attacker hostnames feeding a connector (DNS
+    rebinding), `followRedirects: true` crossing protocol or origin,
+    `rejectUnauthorized: false`, custom `checkServerIdentity` returning
+    `undefined`, custom `https.Agent` with empty `ca`. (OWASP A10 SSRF,
+    A02 Cryptographic Failures)
+  * Cryptography — `crypto.createHash('md5'|'sha1')` for auth/signature,
+    `===`/`!==`/`Buffer.compare` on secrets vs `crypto.timingSafeEqual`,
+    `Math.random()`/`Date.now()` seeding tokens, session IDs, or
+    password resets vs `crypto.randomBytes`/`randomUUID`, AES-ECB or
+    fixed/predictable IVs, key material in source or env without
+    rotation, `bcrypt` cost < 10, missing salt on hashes. (OWASP A02)
+  * Authn/authz & session — `jsonwebtoken.verify` without an explicit
+    `algorithms: [...]` list (allows `alg: none` and RS256↔HS256
+    confusion), `decode()` used in place of `verify()`, `kid` header
+    feeding a path/SQL lookup, weak/static JWT secrets, cookies missing
+    `httpOnly`/`secure`/`sameSite`, missing CSRF protection on state-
+    changing routes, IDOR (authz check absent on `req.params.id`),
+    privilege fields trusted from request body. (OWASP A01, A07
+    Identification & Authentication Failures)
+  * Framework misconfiguration — Express without `helmet`, `app.disable(
+    'x-powered-by')` missing, `body-parser`/`express.json` with no
+    `limit` (DoS), `cors({ origin: true, credentials: true })` echoing
+    arbitrary Origin with cookies, `trust proxy` set wrong (spoofed
+    `X-Forwarded-For`/`req.ip`), Fastify `bodyLimit` unbounded, Koa
+    `ctx.body = userObj` leaking internals, Next.js API routes returning
+    `req.headers` directly, multer with `dest` under web root and no
+    MIME/size cap. (OWASP A05 Security Misconfiguration)
+  * Resource exhaustion / DoS — catastrophic-backtracking regex (ReDoS:
+    nested quantifiers, alternation overlap; check user-supplied
+    patterns and any `RegExp(input)`), `JSON.parse` of unbounded input,
+    decompression bombs (`zlib.gunzip`/`inflate`, `pako`, archive
+    extraction with no size cap), unbounded `for await (chunk of req)`,
+    sync XHR / `fs.*Sync` in request hot path, unbounded promise
+    fan-out. (OWASP A04 Insecure Design)
+  * Input validation & coercion — destructuring `req.body`/`req.query`
+    without a schema (zod/joi/yup/ajv), `parseInt(x)` silently accepting
+    `0x`/leading-`+`/trailing garbage, `parseFloat` of `Infinity`/`NaN`
+    not gated by `Number.isFinite`, `==` against `null`/`""`/`0`
+    coercing attacker types, array vs string confusion when
+    `req.query.foo` becomes `string[]` under repeated keys. (A04)
+  * Concurrency & shared state — async TOCTOU (`fs.access` then
+    `fs.open`), module-level mutable singletons mutated per request,
+    missing locks around `read-modify-write` on counters/inventories,
+    `Promise.all` swallowing rejections, unawaited promises losing
+    auth-context (AsyncLocalStorage leaks across requests). (A04)
+  * Secrets & logging hygiene — secrets in source, `.env` checked in,
+    `console.log(req)` / `console.log(err)` dumping headers, tokens, or
+    full bodies, log injection via unescaped `\n`/`\r` in user strings,
+    error responses leaking stack traces, source maps shipped to
+    production. (OWASP A09 Logging & Monitoring, A02)
+  * Round-trip & canonicalization integrity — `encodeURIComponent`
+    /`decodeURIComponent` asymmetry on `+` vs `%20`, JSON
+    canonicalization mismatch when verifying a detached signature,
+    Unicode normalization (NFC vs NFD) bypassing equality checks,
+    `toLowerCase()` on Turkish-locale `İ`/`ı` for security comparisons,
+    HTTP request smuggling via mismatched `Content-Length`/`Transfer-
+    Encoding` parsing between proxy and Node. (OWASP A08, A03)
+EOF
+
+read -r -d '' ALWAYS_FLAG_JS <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`eval`, `new Function(...)`, or `setTimeout`/`setInterval` with a
+    string first argument that isn't a string literal.** Direct path to
+    arbitrary code execution in the current realm, with full closure
+    access. The "I'll only pass safe data" defense fails the moment
+    config, env, or DB content reaches it. Severity: **Critical**.
+
+  * **`child_process.exec` / `execSync` whose command string contains
+    any non-constant.** Always invokes `/bin/sh -c` (or `cmd.exe /d /s
+    /c`); a single unescaped metacharacter is RCE. Same for
+    `spawn`/`spawnSync`/`fork` invoked with `{ shell: true }` and any
+    interpolated argv. Use `execFile`/`spawn` with an argv array and
+    `shell: false`. Severity: **Critical**.
+
+  * **`JSON.parse` (or query-string parse) followed by `lodash.merge`/
+    `_.set`/`_.defaultsDeep`/`Object.assign` deep-merge into an existing
+    object, without an allow-listed key filter.** Prototype-pollution
+    primitive: `{"__proto__":{"isAdmin":true}}` poisons every object in
+    the process and frequently chains to RCE through template-engine or
+    `child_process` gadgets. Severity: **High** (Critical if a known
+    gadget is reachable).
+
+  * **`dangerouslySetInnerHTML`, Vue `v-html`, Angular `bypassSecurity-
+    Trust*`, Svelte `{@html ...}`, or assignment to `.innerHTML`/
+    `.outerHTML`/`document.write`/`insertAdjacentHTML` with any non-
+    constant value.** Stored/reflected XSS that sanitization libraries
+    only mitigate when applied unconditionally; sanitizer-free use is a
+    finding on sight. Severity: **High**.
+
+  * **`https`/`tls`/`fetch`/`axios` with `rejectUnauthorized: false`,
+    `NODE_TLS_REJECT_UNAUTHORIZED=0`, an empty `ca`, or a custom
+    `checkServerIdentity` that returns `undefined`/`null`.** Disables
+    certificate validation entirely — attacker on path reads and
+    rewrites traffic. There is no "test only" excuse if the flag can
+    reach production. Severity: **High**.
+
+  * **`jsonwebtoken.verify` (or jose/`fast-jwt`) without an explicit
+    `algorithms: [...]` allow-list, or any code path that calls
+    `jwt.decode()` and trusts the payload.** Enables `alg: none` accept-
+    ance and RS256→HS256 key-confusion attacks; `decode` performs no
+    signature check. Severity: **Critical** (auth bypass).
+
+  * **`Math.random()` / `Date.now()` used to mint a token, session ID,
+    password-reset link, OTP, nonce, or filename guarded by
+    obscurity.** V8's xorshift128+ is non-cryptographic and recoverable
+    from a handful of outputs. Use `crypto.randomBytes` /
+    `crypto.randomUUID`. Severity: **High**.
+
+  * **`cors({ origin: true, credentials: true })` or any CORS handler
+    that reflects `req.headers.origin` into `Access-Control-Allow-
+    Origin` while also allowing credentials.** Turns every authenticated
+    endpoint into a cross-origin readable API for any attacker site.
+    Severity: **High**.
+EOF
+
 read -r -d '' OWASP_REMINDER <<'EOF' || true
 ## OWASP Top 10 coverage check
 
@@ -462,12 +1023,15 @@ ${PER_FILE_DEEP_OUTPUT}
 EOF
 }
 
-# language_for EXT  ->  prints elixir|zig|generic
+# language_for EXT  ->  prints elixir|zig|python|rust|js|generic
 language_for() {
 	case "$1" in
-		ex|exs) printf 'elixir' ;;
-		zig)    printf 'zig' ;;
-		*)      printf 'generic' ;;
+		ex|exs)            printf 'elixir' ;;
+		zig)               printf 'zig' ;;
+		py)                printf 'python' ;;
+		rs)                printf 'rust' ;;
+		js|mjs|cjs|jsx|ts|tsx) printf 'js' ;;
+		*)                 printf 'generic' ;;
 	esac
 }
 
@@ -476,6 +1040,9 @@ header_for() {
 	case "$1" in
 		elixir) printf 'Elixir/Erlang' ;;
 		zig)    printf 'Zig' ;;
+		python) printf 'Python' ;;
+		rust)   printf 'Rust' ;;
+		js)     printf 'JavaScript/TypeScript' ;;
 		*)      printf 'general-purpose' ;;
 	esac
 }
@@ -487,6 +1054,9 @@ build_prompt() {
 	case "$lang" in
 		elixir) sinks="$SINK_CLASSES_ELIXIR"; always="$ALWAYS_FLAG_ELIXIR" ;;
 		zig)    sinks="$SINK_CLASSES_ZIG";    always="$ALWAYS_FLAG_ZIG" ;;
+		python) sinks="$SINK_CLASSES_PYTHON"; always="$ALWAYS_FLAG_PYTHON" ;;
+		rust)   sinks="$SINK_CLASSES_RUST";   always="$ALWAYS_FLAG_RUST" ;;
+		js)     sinks="$SINK_CLASSES_JS";     always="$ALWAYS_FLAG_JS" ;;
 		*)      sinks="$SINK_CLASSES_GENERIC";always="$ALWAYS_FLAG_GENERIC" ;;
 	esac
 	lang_header=$(header_for "$lang")

@@ -29,7 +29,10 @@ Currently:
 |-----------|----------------|-------|
 | `.ex`, `.exs` | Elixir / Erlang | BEAM sinks: `binary_to_term`, dynamic dispatch, ETS, NIF FFI, metaprogramming gadgets, etc. |
 | `.zig` | Zig | Memory + error discipline, integer / UB / casting, `@enumFromInt` / `@ptrCast` on untrusted input, FFI boundary, `catch unreachable`, comptime sinks, etc. |
-| anything else | Generic, OWASP-aware | Language-agnostic sinks tagged with OWASP Top 10 categories. Placeholder for richer per-language prompts (JS, Python, Go, Rust, …). |
+| `.py` | Python | `pickle` / `yaml.load` / `eval` / `subprocess(shell=True)`, XXE, SSTI, ORM injection, Django/Flask/FastAPI misconfig, `random` for tokens, etc. |
+| `.rs` | Rust | `unsafe` blocks (transmute, raw pointers, `from_raw_parts`), FFI panics, panic-as-DoS via `.unwrap()`/indexing, integer wrap in release, `serde` deserialization without size caps, async cancel safety, `unsafe impl Send/Sync`, etc. |
+| `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx` | JavaScript / TypeScript | `eval`/`Function`, `child_process.exec`, prototype pollution via deep-merge, `dangerouslySetInnerHTML` / `v-html` / `innerHTML`, JWT `alg: none`, `rejectUnauthorized: false`, ReDoS, CORS misconfig, `Math.random()` for secrets, etc. |
+| anything else | Generic, OWASP-aware | Language-agnostic sinks tagged with OWASP Top 10 categories. Fallback for languages without a dedicated prompt (Go, Ruby, Swift, …). |
 
 Each variant carries its own sink-class inventory and "always-flag" list
 (things dangerous enough on sight that no trace/boundary check is needed —
@@ -96,7 +99,7 @@ and modified files are re-processed.
 |------|---------|
 | `--out` | `SECURITY_FINDINGS.md` |
 | `--style` | `deep` (the full inventory + per-sink methodology). `--style simple` skims with the sink list in mind. |
-| `--ext` | `zig,ex,exs` |
+| `--ext` | `zig,ex,exs,py,rs,js,mjs,cjs,jsx,ts,tsx` |
 | `--min-loc` | `10` non-blank lines |
 | `--max-files` | `0` (no cap) |
 | Default excluded dirs | `.git`, `.jj`, `.hg`, `.svn`, `.claude`, `.serena`, `.codescan`, `.cursor`, `.idea`, `.vscode`, `.worktrees`, `.zig-cache`, `zig-out`, `_build`, `.elixir_ls`, `.lexical`, `node_modules`, `dist`, `target`, `vendor`, `deps`, `__pycache__`, `.pytest_cache`, `.tox`, `.next`, `.nuxt`, `cover`, `coverage`. Disable with `--no-default-excludes`; add more with `--exclude NAME` (repeatable). |
