@@ -23,7 +23,7 @@ VERSION="0.1.0"
 
 DEFAULT_OUT="SECURITY_FINDINGS.md"
 DEFAULT_STYLE="deep"        # deep | simple
-DEFAULT_EXTENSIONS=(zig ex exs py rs js mjs cjs jsx ts tsx)
+DEFAULT_EXTENSIONS=(zig ex exs py rs js mjs cjs jsx ts tsx c h cc cpp cxx hpp hh hxx)
 DEFAULT_MIN_LOC=10          # skip files with fewer non-blank lines
 CLI_PREFERENCE=(claude codex gemini)
 
@@ -866,6 +866,210 @@ the input comes from.
     Severity: **High**.
 EOF
 
+read -r -d '' SINK_CLASSES_C <<'EOF' || true
+Sink classes — every place dangerous logic could live in C or C++, regardless
+of whether the input currently looks hostile. One prompt covers both
+languages because the bulk of the attack surface — raw pointers, manual
+memory, the C standard library, the preprocessor, undefined behavior — is
+shared; C++-only constructs are called out where they matter. Enumerate
+first, judge second.
+
+  * Unbounded string copy/concat/format — `strcpy`, `strcat`, `sprintf`,
+    `vsprintf`, `gets`/`gets_s` misuse, `scanf`/`fscanf`/`sscanf` with `%s`
+    or `%[` and no width, `wcscpy`/`wcscat`/`swprintf` analogues, and any
+    `memcpy(dst, src, n)` where `n` is derived from the input rather than
+    from `sizeof(dst)`. Classic stack/heap buffer overflow surface.
+    (CWE-120, CWE-121, CWE-787) (OWASP A03 Injection)
+  * Bounded-but-misused string ops — `strncpy` that silently omits the NUL
+    when `src` length equals `n`, `snprintf`/`vsnprintf` whose return value
+    is treated as bytes-written instead of bytes-that-would-have-been-
+    written (truncation read as success), `strncat`'s third argument being
+    *remaining* space not buffer size, and code that assumes `strlcpy`/
+    `strlcat` exist on glibc without a fallback. (CWE-170, CWE-193)
+  * Format string injection — `printf(user)`, `fprintf(f, user)`,
+    `vprintf`/`vfprintf`, `syslog(LOG_*, user)`, `err`/`warn`/`NSLog` and
+    every variadic logger where the format argument is not a string
+    literal. `%n` enables arbitrary writes; `%s` on a non-string pointer
+    reads through it; `%.*s` with attacker width leaks memory.
+    (CWE-134) (OWASP A03 Injection)
+  * Integer overflow and signed/unsigned confusion — `malloc(n * sizeof T)`
+    or `calloc`-replacement multiplications without `__builtin_mul_overflow`
+    or `SIZE_MAX/sizeof` guard; `int len = strtol(...)` then used as a
+    size; signed overflow that is UB in C and C++ (the compiler legally
+    deletes `if (n + m < n)` checks); narrowing from `size_t`/`ssize_t` to
+    `int`; comparisons like `if (i < strlen(s) - 1)` going negative on
+    empty input; `(unsigned)-1` sentinels mixed with signed indices.
+    (CWE-190, CWE-191, CWE-194, CWE-195)
+  * Memory management — `malloc`/`free` pairing across module boundaries
+    (free in caller of memory allocated by callee with a different
+    allocator), `realloc(p, n)` whose return is assigned back to `p`
+    leaking on failure, double-free, use-after-free, freeing a non-base
+    pointer, freeing stack memory, mismatched `new`/`delete` vs
+    `new[]`/`delete[]` in C++, deleting through a base pointer with no
+    virtual destructor, smart-pointer/raw-pointer custody confusion.
+    (CWE-415, CWE-416, CWE-401, CWE-762)
+  * Pointer and array bugs — array indexing without bounds check, off-by-
+    one via `<= len` or `i <= sizeof(buf)` (sizeof counts the NUL),
+    pointer arithmetic past one-past-end, NULL deref after `malloc`/
+    `fopen`/`getenv` with no check, returning `&local` or a pointer into
+    a `std::string` whose owner has gone out of scope, dangling references
+    after `vector` reallocation, casting away `const` then writing.
+    (CWE-125, CWE-787, CWE-476, CWE-562)
+  * Undefined behavior — signed integer overflow, shift by negative or by
+    `>= width`, dereferencing a NULL or misaligned pointer, type-punning
+    through a union (permitted in C, UB in C++ — use `std::memcpy` or
+    `std::bit_cast`), strict-aliasing violations via `*(T*)p` casts,
+    sequence-point/sequenced-before violations (`i = i++`, `a[i] = i++`),
+    reading uninitialized storage, `memcpy(NULL, NULL, 0)`. Compilers
+    optimize on the assumption UB never happens. (CWE-758, CWE-457)
+  * File and path operations — `fopen`/`open`/`stat`/`unlink` on attacker-
+    controlled paths without canonicalization, TOCTOU between
+    `access()`/`stat()` and the following `open()` (use `openat`/`O_NOFOLLOW`
+    /`fstat`), symlink following on shared dirs, `realpath(p, NULL)`
+    return value leaked, `tmpnam`/`tempnam`/`mktemp` predictable-name
+    races (use `mkstemp`), archive extraction that concatenates entry
+    names into the destination without rejecting `..` and absolute paths
+    (zip-slip/tar-slip). (CWE-22, CWE-367, CWE-377, CWE-59)
+  * Command and process execution — `system()`, `popen()`, `execlp`/
+    `execvp` (PATH lookup against an attacker-set `PATH`), `execve` with
+    user-controlled argv/envp, shelling out through `/bin/sh -c` with
+    string concatenation, `setenv`/`putenv` planting variables that a
+    later subprocess reads (`LD_PRELOAD`, `IFS`, `PATH`).
+    (CWE-78, CWE-88, CWE-426) (OWASP A03 Injection)
+  * Network I/O and parsing — `recv`/`read`/`fread` whose return value is
+    ignored or assigned to `int` then compared `>= 0` wrongly, parsers
+    that trust a length-prefix field and then allocate or copy that many
+    bytes, `htons`/`ntohl` omitted leading to endianness bugs treated as
+    "works on my box", missing partial-read loop, framing/length-confusion
+    between layers, `inet_aton`/`inet_addr` accepting octal `0177...`
+    forms, hostname parsers diverging from the resolver.
+    (CWE-20, CWE-130, CWE-252) (OWASP A04 Insecure Design)
+  * Cryptography and secrets — hardcoded keys/IVs in source, MD5/SHA1/DES/
+    RC4 used for security, `memcmp`/`strcmp` comparing MACs, tokens, or
+    keys (timing oracle — use `CRYPTO_memcmp`/`sodium_memcmp`), `rand()`/
+    `random()`/`srand(time(NULL))` for tokens or nonces instead of
+    `getrandom`/`/dev/urandom`/`RAND_bytes`, ECB mode, fixed/zero IVs,
+    PKCS#1 v1.5 without constant-time handling, TLS verification disabled
+    (`SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL)` or a callback that
+    returns 1 unconditionally, `curl_easy_setopt(CURLOPT_SSL_VERIFYPEER,
+    0)`). (CWE-327, CWE-330, CWE-798, CWE-208, CWE-295)
+    (OWASP A02 Cryptographic Failures, A07 Auth Failures)
+  * C++ object lifetime and library hazards — iterator invalidation when
+    holding an iterator across `vector::push_back`, `unordered_map::insert`
+    /`erase`, or any `std::string` mutation; `std::string_view`/
+    `std::span` outliving its backing storage; `.c_str()`/`.data()`/
+    `.get()` outliving the smart pointer or container; use-after-`std::
+    move`; `std::shared_ptr` reference cycles; throwing across an
+    `extern "C"` boundary (UB); throwing from a destructor during stack
+    unwinding (`std::terminate`); `std::regex` built from user input
+    (libstdc++ is recursive — catastrophic backtracking blows the stack);
+    `reinterpret_cast` between unrelated types, `const_cast` to add
+    mutability then writing through it; template/`std::vector` growth
+    driven by attacker-controlled length. (CWE-416, CWE-704, CWE-1335)
+  * Concurrency — data races on plain `int`/pointer variables touched by
+    multiple threads without `std::atomic` or a mutex, missing or wrong
+    `std::memory_order`, `volatile` misused as a synchronization
+    primitive (it isn't), inconsistent lock ordering across call sites,
+    sleeping or doing I/O while holding a lock, double-checked locking
+    using a raw pointer without acquire/release, leaked locks on early
+    `return`/exception paths (prefer `std::lock_guard`/`scoped_lock`).
+    (CWE-362, CWE-366, CWE-667, CWE-833)
+  * Signals, `errno`, and non-local control — signal handlers calling
+    async-signal-unsafe functions (`malloc`, `printf`, `fprintf`, almost
+    all of stdio), handlers that clobber `errno` without save/restore,
+    `longjmp` out of a signal handler or across a C++ destructor,
+    `setjmp`/`longjmp` skipping object destruction. (CWE-364, CWE-479)
+  * Resource exhaustion / DoS — `malloc(n)` or `new T[n]` where `n` comes
+    from input with no cap, unbounded recursion (recursive descent
+    parsers, JSON/XML/protobuf nesting) with no depth limit, decompression
+    without an output-size guard (`zlib`, `bz2`, `lzma`, `zstd` — classic
+    zip/gzip bombs), `std::regex`/PCRE ReDoS, accept loops with no fd
+    limit, file descriptor leaks under error paths. (CWE-400, CWE-674,
+    CWE-409, CWE-1284) (OWASP A05 Security Misconfiguration)
+  * Validation contracts — predicates whose return type is `int` and that
+    conflate "valid" (0) with "error" (non-zero) at call sites (or vice
+    versa); `is*` macros (`isalpha`, `isspace`) called on a plain `char`
+    that is negative (UB); silent narrowing in mixed signed/unsigned
+    comparisons that flip the branch (`-1 < sizeof x` is false); error
+    returns from `scanf`-family or `strtol` (check `endptr` and `errno`)
+    ignored. (CWE-754, CWE-252, CWE-704)
+  * Preprocessor and build hazards — macros that double-evaluate side
+    effects (`#define MAX(a,b) ((a)>(b)?(a):(b))` invoked as
+    `MAX(i++, j++)`), macros without parenthesized arguments causing
+    operator-precedence bugs, `#include` paths controlled by build-time
+    input, conditional compilation hiding security checks
+    (`#ifdef DEBUG` paths shipped enabled), `assert()` used for runtime
+    validation (compiled out in `NDEBUG` builds), `-fno-stack-protector`
+    /`-D_FORTIFY_SOURCE=0` in release flags. (CWE-733, CWE-1357)
+EOF
+
+read -r -d '' ALWAYS_FLAG_C <<'EOF' || true
+## Always-flag
+
+Some sinks are dangerous enough on sight that the trace/boundary check is
+skipped — flag every occurrence as a finding even if you can't trace where
+the input comes from.
+
+  * **`gets`, `strcpy`, `strcat`, `sprintf`, `vsprintf`, `scanf`/`sscanf`/
+    `fscanf` with `%s` or `%[` and no width.** Unbounded by construction;
+    the destination size is not an argument. `gets` was removed in C11 but
+    still appears in legacy code and tutorials. Severity: **Critical**.
+    (CWE-120, CWE-242)
+  * **`printf`/`fprintf`/`sprintf`/`snprintf`/`vprintf`/`syslog`/`NSLog`
+    where the format argument is not a string literal.** Variadic
+    format-string parsing on untrusted data permits `%n` writes, info leaks
+    via `%s`/`%x`, and crashes. Even a "trusted" caller wraps an untrusted
+    one eventually. Severity: **Critical**. (CWE-134)
+  * **`system()`, `popen()`, `execlp`/`execvp` with any non-literal in the
+    command or program name.** `/bin/sh -c` re-parses the string,
+    `execvp`/`execlp` walk `$PATH`. Command injection and PATH hijacking
+    are immediate. Severity: **Critical**. (CWE-78, CWE-426)
+  * **`memcpy`/`memmove`/`memset`/`bcopy` with a length computed from
+    input and no explicit `min(n, sizeof dst)` clamp.** One bad length
+    field, one signed/unsigned slip, and you have a heap overflow or
+    info leak (Heartbleed-shaped). Severity: **High**. (CWE-120, CWE-787)
+  * **`malloc(n * sizeof T)` / `new T[n]` without an overflow-checked
+    multiply when `n` is attacker-influenced.** Wraps to a tiny allocation
+    followed by a large copy. Use `__builtin_mul_overflow`, `calloc`'s
+    built-in check, or `SIZE_MAX / sizeof(T)` guard. Severity: **High**.
+    (CWE-190, CWE-680)
+  * **`strncpy(dst, src, sizeof dst)` with no explicit
+    `dst[sizeof dst - 1] = '\0';` follow-up.** When `src` is exactly the
+    buffer size, `strncpy` does not write a terminator; the next
+    `strlen`/`printf` walks off the end. Severity: **High**.
+    (CWE-170, CWE-125)
+  * **`rand()`, `random()`, `srand(time(NULL))`, `std::rand`,
+    `mt19937` seeded from time, for tokens, session IDs, nonces, keys,
+    or password resets.** Predictable across runs and across processes
+    started in the same second. Use `getrandom`, `/dev/urandom`,
+    `RAND_bytes`, `arc4random_buf`, or `std::random_device` plus a CSPRNG.
+    Severity: **High**. (CWE-330, CWE-338)
+  * **`memcmp`/`strcmp`/`strncmp` comparing secrets, MACs, tokens, or
+    capability strings.** Early-exit on first mismatch leaks length and
+    prefix via timing. Use `CRYPTO_memcmp`, `sodium_memcmp`,
+    `timingsafe_bcmp`, or a hand-rolled constant-time loop. Severity:
+    **High**. (CWE-208, CWE-1254)
+  * **`SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL)`, a verify callback
+    that returns `1` unconditionally, `CURLOPT_SSL_VERIFYPEER=0`,
+    `CURLOPT_SSL_VERIFYHOST=0`, or any hostname check that's a substring
+    match.** TLS without verification is plaintext with overhead.
+    Severity: **High**. (CWE-295, CWE-297)
+  * **C++ `std::regex` constructed from user input.** libstdc++'s
+    implementation is recursive; catastrophic backtracking on a crafted
+    pattern blows the stack and crashes the process. Pre-compile literals
+    only, or use RE2. Severity: **High**. (CWE-1333, CWE-674)
+  * **`reinterpret_cast` between unrelated types, `const_cast` that adds
+    mutability then writes, or `*(T*)p` C-style casts that punning-cast
+    pointers.** Strict-aliasing UB; the optimizer reorders or deletes
+    surrounding code. Use `std::memcpy` or `std::bit_cast`. Severity:
+    **High**. (CWE-704, CWE-843)
+  * **Hardcoded cryptographic keys, IVs, passwords, or API tokens in
+    source, and use of MD5/SHA1/DES/RC4/ECB-mode for security purposes.**
+    Findable by `strings(1)` and broken on first principles. Severity:
+    **Critical** for keys, **High** for the broken primitives.
+    (CWE-798, CWE-327)
+EOF
+
 read -r -d '' OWASP_REMINDER <<'EOF' || true
 ## OWASP Top 10 coverage check
 
@@ -1023,7 +1227,7 @@ ${PER_FILE_DEEP_OUTPUT}
 EOF
 }
 
-# language_for EXT  ->  prints elixir|zig|python|rust|js|generic
+# language_for EXT  ->  prints elixir|zig|python|rust|js|c|generic
 language_for() {
 	case "$1" in
 		ex|exs)            printf 'elixir' ;;
@@ -1031,6 +1235,7 @@ language_for() {
 		py)                printf 'python' ;;
 		rs)                printf 'rust' ;;
 		js|mjs|cjs|jsx|ts|tsx) printf 'js' ;;
+		c|h|cc|cpp|cxx|hpp|hh|hxx) printf 'c' ;;
 		*)                 printf 'generic' ;;
 	esac
 }
@@ -1043,6 +1248,7 @@ header_for() {
 		python) printf 'Python' ;;
 		rust)   printf 'Rust' ;;
 		js)     printf 'JavaScript/TypeScript' ;;
+		c)      printf 'C/C++' ;;
 		*)      printf 'general-purpose' ;;
 	esac
 }
@@ -1057,6 +1263,7 @@ build_prompt() {
 		python) sinks="$SINK_CLASSES_PYTHON"; always="$ALWAYS_FLAG_PYTHON" ;;
 		rust)   sinks="$SINK_CLASSES_RUST";   always="$ALWAYS_FLAG_RUST" ;;
 		js)     sinks="$SINK_CLASSES_JS";     always="$ALWAYS_FLAG_JS" ;;
+		c)      sinks="$SINK_CLASSES_C";      always="$ALWAYS_FLAG_C" ;;
 		*)      sinks="$SINK_CLASSES_GENERIC";always="$ALWAYS_FLAG_GENERIC" ;;
 	esac
 	lang_header=$(header_for "$lang")

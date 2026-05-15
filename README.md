@@ -37,6 +37,7 @@ Currently:
 | `.py` | Python | `pickle` / `yaml.load` / `eval` / `subprocess(shell=True)`, XXE, SSTI, ORM injection, Django/Flask/FastAPI misconfig, `random` for tokens, etc. |
 | `.rs` | Rust | `unsafe` blocks (transmute, raw pointers, `from_raw_parts`), FFI panics, panic-as-DoS via `.unwrap()`/indexing, integer wrap in release, `serde` deserialization without size caps, async cancel safety, `unsafe impl Send/Sync`, etc. |
 | `.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx` | JavaScript / TypeScript | `eval`/`Function`, `child_process.exec`, prototype pollution via deep-merge, `dangerouslySetInnerHTML` / `v-html` / `innerHTML`, JWT `alg: none`, `rejectUnauthorized: false`, ReDoS, CORS misconfig, `Math.random()` for secrets, etc. |
+| `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx` | C / C++ | Unbounded string ops (`strcpy`, `sprintf`, `gets`), format-string injection, integer overflow in size math, `memcpy`/`malloc` with attacker length, TOCTOU, `system`/`popen`, UB (signed overflow, strict aliasing, `reinterpret_cast`), C++ iterator invalidation, `std::regex` ReDoS, throwing across `extern "C"`, etc. CWE/CERT-flavored. |
 | anything else | Generic, OWASP-aware | Language-agnostic sinks tagged with OWASP Top 10 categories. Fallback for languages without a dedicated prompt (Go, Ruby, Swift, …). |
 
 Each variant carries its own sink-class inventory and "always-flag" list
@@ -104,7 +105,7 @@ and modified files are re-processed.
 |------|---------|
 | `--out` | `SECURITY_FINDINGS.md` |
 | `--style` | `deep` (the full inventory + per-sink methodology). `--style simple` skims with the sink list in mind. |
-| `--ext` | `zig,ex,exs,py,rs,js,mjs,cjs,jsx,ts,tsx` |
+| `--ext` | `zig,ex,exs,py,rs,js,mjs,cjs,jsx,ts,tsx,c,h,cc,cpp,cxx,hpp,hh,hxx` |
 | `--min-loc` | `10` non-blank lines |
 | `--max-files` | `0` (no cap) |
 | Default excluded dirs | `.git`, `.jj`, `.hg`, `.svn`, `.claude`, `.serena`, `.codescan`, `.cursor`, `.idea`, `.vscode`, `.worktrees`, `.zig-cache`, `zig-out`, `_build`, `.elixir_ls`, `.lexical`, `node_modules`, `dist`, `target`, `vendor`, `deps`, `__pycache__`, `.pytest_cache`, `.tox`, `.next`, `.nuxt`, `cover`, `coverage`. Disable with `--no-default-excludes`; add more with `--exclude NAME` (repeatable). |
