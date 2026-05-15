@@ -1407,6 +1407,7 @@ Options:
                      Output path for --extract-actionable.
   -h, --help         Show this help.
   --version          Print version.
+  --about            Print one-line app/version/platform/arch summary.
 
 Environment:
   SECREVIEW_LLM_CLI  Override the CLI auto-detection (claude|codex|gemini).
@@ -1471,6 +1472,14 @@ main() {
 			--actionable-out) actionable_out="$2"; shift 2 ;;
 			-h|--help) usage; return 0 ;;
 			--version) printf 'secreview v%s\n' "$VERSION"; return 0 ;;
+			--about)
+				local platform arch
+				platform=$(uname -s | tr '[:upper:]' '[:lower:]')
+				arch=$(uname -m)
+				printf 'secreview v%s — LLM-driven per-file security review · %s/%s\n' \
+					"$VERSION" "$platform" "$arch"
+				return 0
+				;;
 			--)        shift; path="$1"; shift ;;
 			-*)        printf 'secreview: unknown option: %s\n' "$1" >&2; return 2 ;;
 			*)

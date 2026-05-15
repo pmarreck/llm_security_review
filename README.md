@@ -11,7 +11,7 @@ a master Markdown doc, one section per file, with HTML-comment markers
 carrying the review timestamp and the source file's mtime so reruns only
 re-review files that have changed since.
 
-This repo contains two things:
+This repo contains three things:
 
 - `elixir_reviewer.ex` — the original Elixir module that this pattern grew
   from. Useful as a reference if you want to embed the same prompts inside a
@@ -20,6 +20,11 @@ This repo contains two things:
   from the shell. Walks a path, filters by extension, picks the right prompt
   variant per language, shells out to claude / codex / gemini, and manages
   the master findings doc.
+- `bin/llm-security-review` — symlink to `secreview` with a PATH-friendly,
+  unambiguous name. If you keep a `bin/` directory on `PATH` (a common
+  dotfile pattern), cloning the repo and pointing your `PATH` at this
+  `bin/` is the fastest way to get the tool everywhere. Standard probes
+  work through the symlink: `--help`, `--version`, `--about`.
 
 ## Supported languages
 
